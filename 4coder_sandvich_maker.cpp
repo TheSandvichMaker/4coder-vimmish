@@ -23,10 +23,12 @@ inline i64 motion_end_pos(Snd_Motion_Result motion_result) {
     return result;
 }
 
-typedef Snd_Motion_Result Snd_Motion(Application_Links* app, Buffer_ID buffer, i64 start_pos);
-typedef void Snd_Action(Application_Links* app, Snd_Motion* motion);
+#define SND_MOTION(name) Snd_Motion_Result name(Application_Links* app, Buffer_ID buffer, i64 start_pos)
+typedef SND_MOTION(Snd_Motion);
 
-global i32 motion_count;
+#define SND_ACTION(name) void name(Application_Links* app, Snd_Motion_Result mr)
+typedef SND_ACTION(Snd_Action);
+
 global Snd_Action* pending_action;
 
 enum Snd_Buffer_Flag {
@@ -788,12 +790,12 @@ internal Snd_Motion_Result snd_word_motion_internal(Application_Links* app, Buff
     return result;
 }
 
-internal Snd_Motion_Result snd_word_motion_right(Application_Links* app, Buffer_ID buffer, i64 pos) {
-    return snd_word_motion_internal(app, buffer, Scan_Forward, pos);
+internal SND_MOTION(snd_word_motion_right) {
+    return snd_word_motion_internal(app, buffer, Scan_Forward, start_pos);
 }
 
-internal Snd_Motion_Result snd_word_motion_left(Application_Links* app, Buffer_ID buffer, i64 pos) {
-    return snd_word_motion_internal(app, buffer, Scan_Backward, pos);
+internal SND_MOTION(snd_word_motion_left) {
+    return snd_word_motion_internal(app, buffer, Scan_Backward, start_pos);
 }
 
 internal Snd_Motion_Result snd_line_side_motion_internal(Application_Links* app, Buffer_ID buffer, Scan_Direction dir, i64 pos) {
@@ -804,15 +806,15 @@ internal Snd_Motion_Result snd_line_side_motion_internal(Application_Links* app,
     return result;
 }
 
-internal Snd_Motion_Result snd_line_side_motion_right(Application_Links* app, Buffer_ID buffer, i64 pos) {
-    return snd_line_side_motion_internal(app, buffer, Scan_Forward, pos);
+internal SND_MOTION(snd_line_side_motion_right) {
+    return snd_line_side_motion_internal(app, buffer, Scan_Forward, start_pos);
 }
 
-internal Snd_Motion_Result snd_line_side_motion_left(Application_Links* app, Buffer_ID buffer, i64 pos) {
-    return snd_line_side_motion_internal(app, buffer, Scan_Backward, pos);
+internal SND_MOTION(snd_line_side_motion_left) {
+    return snd_line_side_motion_internal(app, buffer, Scan_Backward, start_pos);
 }
 
-internal Snd_Motion_Result snd_execute_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, Snd_Motion* motion) {
+internal Snd_Motion_Result snd_execute_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, i32 motion_count, Snd_Motion* motion) {
     Snd_Motion_Result result = { Ii64_neg_inf };
     i64 curr_pos = start_pos;
     for (i32 motion_index = 0; motion_index < motion_count; motion_index++) {
@@ -824,15 +826,15 @@ internal Snd_Motion_Result snd_execute_motion(Application_Links* app, Buffer_ID 
     return result;
 }
 
-internal void snd_seek_using_motion(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Motion* motion) {
+#if 0
+internal void snd_seek_using_motion(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Motion_Result motion) {
     Snd_Motion_Result motion_result = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion);
     view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(motion_result)));
 }
+#endif
 
-internal void snd_cut_using_motion(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Motion* motion) {
+internal void snd_cut_range(Application_Links* app, View_ID view, Buffer_ID buffer, Range_i64 range) {
     History_Group history = history_group_begin(app, buffer);
-
-    Range_i64 range = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion).range;
 
     view_set_cursor(app, view, seek_pos(range.min));
     view_set_mark(app, view, seek_pos(range.max));
@@ -840,13 +842,13 @@ internal void snd_cut_using_motion(Application_Links* app, View_ID view, Buffer_
     cut(app);
 }
 
-internal void snd_change_action(Application_Links* app, Snd_Motion* motion) {
+internal SND_ACTION(snd_change_action) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
     History_Group history = history_group_begin(app, buffer);
 
-    snd_cut_using_motion(app, view, buffer, motion);
+    snd_cut_range(app, view, buffer, mr.range);
     snd_exit_command_mode_internal(app, history);
 }
 
@@ -854,7 +856,7 @@ internal void snd_query_motion(Application_Links* app) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-    motion_count = 1;
+    i32 motion_count = -1;
 
     Snd_Motion* motion = 0;
 
@@ -876,27 +878,31 @@ internal void snd_query_motion(Application_Links* app) {
             pick_motion(snd_line_side_motion_right);
         } else {
             String_Const_u8 in_string = to_writable(&in);
-            if (string_is_integer(in_string, 10)) {
+            if (in_string.size && string_is_integer(in_string, 10)) {
                 i32 count = cast(i32) string_to_integer(in_string, 10);
-                if (motion_count == 1) {
+                if (motion_count < 0) {
                     motion_count = count;
                 } else {
                     motion_count = 10*motion_count + count;
                 }
             } else {
                 leave_current_input_unhandled(app);
-                break;
             }
         }
     }
 #undef pick_motion
 
+    if (motion_count < 0) {
+        motion_count = 1;
+    }
+
     if (motion) {
+        Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion_count, motion);
         if (pending_action) {
-            pending_action(app, motion);
+            pending_action(app, mr);
             pending_action = 0;
         } else {
-            snd_seek_using_motion(app, view, buffer, motion);
+            view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
         }
     }
 }
@@ -914,14 +920,16 @@ CUSTOM_COMMAND_SIG(snd_do_word_motion_right) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-    snd_seek_using_motion(app, view, buffer, snd_word_motion_right);
+    Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), 1, snd_word_motion_right);
+    view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
 }
 
 CUSTOM_COMMAND_SIG(snd_do_word_motion_left) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-    snd_seek_using_motion(app, view, buffer, snd_word_motion_left);
+    Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), 1, snd_word_motion_left);
+    view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
 }
 
 CUSTOM_COMMAND_SIG(snd_move_left_word)
