@@ -15,11 +15,11 @@ CUSTOM_ID(attachment, snd_buffer_attachment);
 
 struct Snd_Motion_Result {
     Range_i64 range;
-    b32 max_is_end;
+    i64 seek_pos;
 };
 
-inline i64 motion_end_pos(Snd_Motion_Result motion_result) {
-    i64 result = motion_result.max_is_end ? motion_result.range.max : motion_result.range.min;
+inline Snd_Motion_Result snd_null_motion(i64 pos) {
+    Snd_Motion_Result result = { Ii64(pos, pos), pos };
     return result;
 }
 
@@ -29,7 +29,18 @@ typedef SND_MOTION(Snd_Motion);
 #define SND_ACTION(name) void name(Application_Links* app, Snd_Motion_Result mr)
 typedef SND_ACTION(Snd_Action);
 
-global Snd_Action* pending_action;
+struct Snd_Command {
+    Snd_Action* action;
+    Snd_Motion* motion;
+    i32 motion_count;
+};
+
+inline b32 snd_command_is_valid(Snd_Command command) {
+    b32 result = (command.motion && command.motion_count > 0);
+    return result;
+}
+
+Snd_Command snd_most_recent_command;
 
 enum Snd_Buffer_Flag {
     SndBufferFlag_TreatAsCode = 0x1,
@@ -129,20 +140,6 @@ CUSTOM_DOC("Input consumption loop for default view behavior")
 
             // NOTE(allen): call the command
             binding.custom(app);
-
-#if 0
-            // NOTE(snd): yo
-            if (!snd_first_free_command_node) {
-                snd_first_free_command_node = push_array(&tctx->node_arena, SndCommandNode, 1);
-                snd_first_free_command_node->next = 0;
-            }
-
-            SndCommandNode* command_node = snd_first_free_command_node;
-            snd_first_free_command_node = command_node->next;
-
-            command_node->next = snd_first_command_node;
-            snd_first_command_node = command_node;
-#endif
 
             // NOTE(allen): after the command is called do some book keeping
             ProfileScope(app, "after view input");
@@ -630,8 +627,8 @@ CUSTOM_COMMAND_SIG(snd_move_right_token_end)
     }
 }
 
-CUSTOM_COMMAND_SIG(snd_cut) {
-    // snd_move_right_on_line(app);
+CUSTOM_COMMAND_SIG(snd_inclusive_cut) {
+    move_right(app);
     cut(app);
 }
 
@@ -641,7 +638,8 @@ CUSTOM_COMMAND_SIG(snd_change) {
 
     History_Group history = history_group_begin(app, buffer);
 
-    snd_cut(app);
+    snd_inclusive_cut(app);
+
     snd_exit_command_mode_internal(app, history);
 }
 
@@ -749,18 +747,17 @@ internal i64 snd_boundary_word(Application_Links* app, Buffer_ID buffer, Side si
 internal Snd_Motion_Result snd_word_motion_internal(Application_Links* app, Buffer_ID buffer, Scan_Direction dir, i64 pos) {
     Scratch_Block scratch(app);
 
-    Snd_Motion_Result result = {};
+    Snd_Motion_Result result = snd_null_motion(pos);
 
     i64 start_pos = pos;
     i64 end_pos   = pos;
 
     if (dir == Scan_Forward) {
-        result.max_is_end = true;
         if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, pos))) {
-                i64 next_line = get_line_number_from_pos(app, buffer, pos) + 1;
-                i64 next_line_start = get_pos_past_lead_whitespace_from_line_number(app, buffer, next_line);
+            i64 next_line = get_line_number_from_pos(app, buffer, pos) + 1;
+            i64 next_line_start = get_pos_past_lead_whitespace_from_line_number(app, buffer, next_line);
 
-                end_pos = next_line_start;
+            end_pos = next_line_start;
         } else {
             end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Forward, end_pos);
 
@@ -770,7 +767,6 @@ internal Snd_Motion_Result snd_word_motion_internal(Application_Links* app, Buff
             }
         }
     } else {
-        result.max_is_end = false;
         if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, pos))) {
             i64 next_line = get_line_number_from_pos(app, buffer, pos) - 1;
             i64 next_line_end = get_line_end_pos(app, buffer, next_line);
@@ -786,6 +782,7 @@ internal Snd_Motion_Result snd_word_motion_internal(Application_Links* app, Buff
         }
     }
 
+    result.seek_pos = end_pos;
     result.range = Ii64(start_pos, end_pos);
     return result;
 }
@@ -801,7 +798,7 @@ internal SND_MOTION(snd_word_motion_left) {
 internal Snd_Motion_Result snd_line_side_motion_internal(Application_Links* app, Buffer_ID buffer, Scan_Direction dir, i64 pos) {
     Snd_Motion_Result result;
     result.range = Ii64(pos, get_line_side_pos_from_pos(app, buffer, pos, dir == Scan_Forward ? Side_Max : Side_Min));
-    result.max_is_end = dir == Scan_Forward;
+    result.seek_pos = (dir == Scan_Forward) ? result.range.max : result.range.min;
 
     return result;
 }
@@ -814,32 +811,101 @@ internal SND_MOTION(snd_line_side_motion_left) {
     return snd_line_side_motion_internal(app, buffer, Scan_Backward, start_pos);
 }
 
+internal SND_MOTION(snd_scope_motion) {
+    Snd_Motion_Result result = snd_null_motion(start_pos);
+
+    Token_Array token_array = get_token_array_from_buffer(app, buffer);
+    if (token_array.count > 0) {
+        Token_Base_Kind opening_token = TokenBaseKind_EOF;
+        Range_i64 line_range = get_line_pos_range(app, buffer, get_line_number_from_pos(app, buffer, start_pos));
+        Token_Iterator_Array it = token_iterator_pos(0, &token_array, start_pos);
+
+        b32 loop = true;
+        while (loop && opening_token == TokenBaseKind_EOF) {
+            Token* token = token_it_read(&it);
+            if (range_contains_inclusive(line_range, token->pos)) {
+                switch (token->kind) {
+                    case TokenBaseKind_ParentheticalOpen:
+                    case TokenBaseKind_ScopeOpen:
+                    case TokenBaseKind_ParentheticalClose:
+                    case TokenBaseKind_ScopeClose: {
+                        opening_token = token->kind;
+                    } break;
+
+                    default: {
+                        loop = token_it_inc(&it);
+                    } break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if (opening_token != TokenBaseKind_EOF) {
+            b32 scan_forward = (opening_token == TokenBaseKind_ScopeOpen || opening_token == TokenBaseKind_ParentheticalOpen);
+
+            Token_Base_Kind closing_token = TokenBaseKind_EOF;
+            if (opening_token == TokenBaseKind_ParentheticalOpen)  closing_token = TokenBaseKind_ParentheticalClose;
+            if (opening_token == TokenBaseKind_ParentheticalClose) closing_token = TokenBaseKind_ParentheticalOpen;
+            if (opening_token == TokenBaseKind_ScopeOpen)          closing_token = TokenBaseKind_ScopeClose;
+            if (opening_token == TokenBaseKind_ScopeClose)         closing_token = TokenBaseKind_ScopeOpen;
+
+            i32 scope_depth = 1;
+            for (;;) {
+                b32 tokens_left = scan_forward ? token_it_inc(&it) : token_it_dec(&it);
+                if (tokens_left) {
+                    Token* token = token_it_read(&it);
+
+                    if (token->kind == opening_token) {
+                        scope_depth++;
+                    } else if (token->kind == closing_token) {
+                        scope_depth--;
+                    }
+
+                    if (scope_depth == 0) {
+                        i64 end_pos = token->pos;
+                        if (scan_forward) {
+                            end_pos += token->size - 1;
+                        }
+
+                        result.seek_pos = end_pos;
+                        result.range = Ii64(start_pos, end_pos);
+
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 internal Snd_Motion_Result snd_execute_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, i32 motion_count, Snd_Motion* motion) {
-    Snd_Motion_Result result = { Ii64_neg_inf };
-    i64 curr_pos = start_pos;
+    Snd_Motion_Result result = { Ii64_neg_inf, start_pos };
     for (i32 motion_index = 0; motion_index < motion_count; motion_index++) {
-        Snd_Motion_Result inner_result = motion(app, buffer, curr_pos);
-        result.range = range_union(result.range, inner_result.range);
-        result.max_is_end = inner_result.max_is_end;
-        curr_pos = motion_end_pos(result);
+        Snd_Motion_Result inner_result = motion(app, buffer, result.seek_pos);
+        result = { range_union(result.range, inner_result.range), inner_result.seek_pos };
     }
     return result;
 }
 
-#if 0
-internal void snd_seek_using_motion(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Motion_Result motion) {
-    Snd_Motion_Result motion_result = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion);
-    view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(motion_result)));
-}
-#endif
-
-internal void snd_cut_range(Application_Links* app, View_ID view, Buffer_ID buffer, Range_i64 range) {
+internal void snd_cut_range_inclusive(Application_Links* app, View_ID view, Buffer_ID buffer, Range_i64 range) {
     History_Group history = history_group_begin(app, buffer);
 
     view_set_cursor(app, view, seek_pos(range.min));
-    view_set_mark(app, view, seek_pos(range.max));
+    view_set_mark(app, view, seek_pos(range.max + 1));
 
     cut(app);
+}
+
+internal SND_ACTION(snd_cut_action) {
+    View_ID view = get_active_view(app, Access_ReadVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+    snd_cut_range_inclusive(app, view, buffer, mr.range);
 }
 
 internal SND_ACTION(snd_change_action) {
@@ -848,49 +914,92 @@ internal SND_ACTION(snd_change_action) {
 
     History_Group history = history_group_begin(app, buffer);
 
-    snd_cut_range(app, view, buffer, mr.range);
+    snd_cut_range_inclusive(app, view, buffer, mr.range);
+
     snd_exit_command_mode_internal(app, history);
 }
 
-internal void snd_query_motion(Application_Links* app) {
+internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
     i32 motion_count = -1;
 
+    b32 action_is_one_shy = false;
+    b32 only_range_is_one_shy = false;
+    Snd_Action* action = 0;
     Snd_Motion* motion = 0;
 
-#define pick_motion(Motion) motion = Motion; break;
-    for (;;) {
-        User_Input in = get_next_input(app, EventPropertyGroup_AnyKeyboardEvent, EventProperty_Escape|EventProperty_ViewActivation);
+    User_Input in = get_current_input(app);
 
+    for (;;) {
         if (in.abort) {
             break;
         }
 
-        if (match_key_code(&in, KeyCode_W)) {
-            pick_motion(snd_word_motion_right);
-        } else if (match_key_code(&in, KeyCode_B)) {
-            pick_motion(snd_word_motion_left);
-        } else if (match_key_code(&in, KeyCode_0)) {
-            pick_motion(snd_line_side_motion_left);
-        } else if (match_key_code(&in, KeyCode_4) && has_modifier(&in, KeyCode_Shift)) {
-            pick_motion(snd_line_side_motion_right);
-        } else {
-            String_Const_u8 in_string = to_writable(&in);
-            if (in_string.size && string_is_integer(in_string, 10)) {
-                i32 count = cast(i32) string_to_integer(in_string, 10);
-                if (motion_count < 0) {
-                    motion_count = count;
-                } else {
-                    motion_count = 10*motion_count + count;
-                }
+        Snd_Action* entered_action = 0;
+        if (match_key_code(&in, KeyCode_C)) {
+            entered_action = snd_change_action;
+        } else if (match_key_code(&in, KeyCode_D)) {
+            entered_action = snd_cut_action;
+        }
+
+        if (entered_action) {
+            if (!action) {
+                action = entered_action;
             } else {
-                leave_current_input_unhandled(app);
+                if (action == entered_action) {
+                    // @Incomplete: Do the right behaviour
+                    break;
+                } else {
+                    break;
+                }
             }
         }
+
+        if (!entered_action) {
+            Snd_Motion* entered_motion = 0;
+            if (match_key_code(&in, KeyCode_W)) {
+                entered_motion = snd_word_motion_right;
+                action_is_one_shy = true;
+            } else if (match_key_code(&in, KeyCode_B)) {
+                entered_motion = snd_word_motion_left;
+            } else if (match_key_code(&in, KeyCode_0)) {
+                entered_motion = snd_line_side_motion_left;
+                action_is_one_shy = true;
+                only_range_is_one_shy = true;
+            } else if (match_key_code(&in, KeyCode_4) && has_modifier(&in, KeyCode_Shift)) {
+                entered_motion = snd_line_side_motion_right;
+                action_is_one_shy = true;
+            } else if (match_key_code(&in, KeyCode_5) && has_modifier(&in, KeyCode_Shift)) {
+                entered_motion = snd_scope_motion;
+            } else {
+                String_Const_u8 in_string = to_writable(&in);
+                if (in_string.size) {
+                    if (string_is_integer(in_string, 10)) {
+                        i32 count = cast(i32) string_to_integer(in_string, 10);
+                        if (motion_count < 0) {
+                            motion_count = count;
+                        } else {
+                            motion_count = 10*motion_count + count;
+                        }
+                    } else {
+                        leave_current_input_unhandled(app);
+                        break;
+                    }
+                } else {
+                    leave_current_input_unhandled(app);
+                }
+            }
+
+            if (entered_motion) {
+                motion = entered_motion;
+                break;
+            }
+        }
+
+        in = get_next_input(app, EventPropertyGroup_AnyKeyboardEvent, EventProperty_Escape|EventProperty_ViewActivation);
     }
-#undef pick_motion
 
     if (motion_count < 0) {
         motion_count = 1;
@@ -898,58 +1007,42 @@ internal void snd_query_motion(Application_Links* app) {
 
     if (motion) {
         Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion_count, motion);
-        if (pending_action) {
-            pending_action(app, mr);
-            pending_action = 0;
+        if (action) {
+            if (action_is_one_shy) {
+                // @Unicode!!
+                if (mr.range.max - mr.range.min > 1) {
+                    mr.range.max--;
+                    if (!only_range_is_one_shy) {
+                        mr.seek_pos--;
+                    }
+                }
+            }
+
+            snd_most_recent_command = { action, motion, motion_count };
+            action(app, mr);
         } else {
-            view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
+            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
         }
     }
 }
 
-internal void snd_push_action(Application_Links* app, Snd_Action* action) {
-    pending_action = action;
-    snd_query_motion(app);
-}
+CUSTOM_COMMAND_SIG(snd_repeat_most_recent_command) {
+    if (snd_command_is_valid(snd_most_recent_command)) {
+        View_ID view = get_active_view(app, Access_ReadVisible);
+        Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-CUSTOM_COMMAND_SIG(snd_push_change) {
-    snd_push_action(app, snd_change_action);
-}
-
-CUSTOM_COMMAND_SIG(snd_do_word_motion_right) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
-
-    Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), 1, snd_word_motion_right);
-    view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
-}
-
-CUSTOM_COMMAND_SIG(snd_do_word_motion_left) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
-
-    Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), 1, snd_word_motion_left);
-    view_set_cursor_and_preferred_x(app, view, seek_pos(motion_end_pos(mr)));
-}
-
-CUSTOM_COMMAND_SIG(snd_move_left_word)
-{
-    Scratch_Block scratch(app);
-
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
-
-    if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view)))) {
-        i64 next_line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view)) - 1;
-        i64 next_line_end = get_line_end_pos(app, buffer, next_line);
-
-        view_set_cursor_and_preferred_x(app, view, seek_pos(next_line_end));
-    } else {
-        current_view_scan_move(app, Scan_Backward, push_boundary_list(scratch, snd_boundary_word, boundary_line));
-
-        u8 c_at_cursor = buffer_get_char(app, buffer, view_get_cursor_pos(app, view));
-        if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
-            current_view_scan_move(app, Scan_Backward, push_boundary_list(scratch, snd_boundary_word, boundary_whitespace, boundary_line));
+        Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), snd_most_recent_command.motion_count, snd_most_recent_command.motion);
+        if (snd_most_recent_command.action) {
+            snd_most_recent_command.action(app, mr);
+            // @TODO: Use buffer_history_get_record_info
+#if 0
+            if (snd_most_recent_command.action == snd_change_action) {
+                buffer_replace_range(app, buffer, Ii64(view_get_cursor_pos(app, view)), snd_inserted_text.string);
+                snd_enter_command_mode(app);
+            }
+#endif
+        } else {
+            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
         }
     }
 }
@@ -965,7 +1058,7 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(keyboard_macro_start_recording ,   KeyCode_U, KeyCode_Control);
         Bind(keyboard_macro_finish_recording,   KeyCode_U, KeyCode_Control, KeyCode_Shift);
         Bind(keyboard_macro_replay,             KeyCode_U, KeyCode_Alt);
-        Bind(change_active_panel,               KeyCode_Comma, KeyCode_Control);
+        Bind(change_active_panel,               KeyCode_W, KeyCode_Control);
         Bind(change_active_panel_backwards,     KeyCode_Comma, KeyCode_Control, KeyCode_Shift);
         Bind(interactive_new,                   KeyCode_N, KeyCode_Control);
         Bind(interactive_open_or_new,           KeyCode_O, KeyCode_Control);
@@ -1118,6 +1211,18 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
     SelectMap(command_id);
     {
         ParentMap(shared_id);
+        // @Note(snd): These are handled specially
+        Bind(snd_handle_chordal_input,                      KeyCode_W);
+        Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Control);
+        Bind(snd_handle_chordal_input,                      KeyCode_B);
+        Bind(snd_handle_chordal_input,                      KeyCode_B, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_D);
+        Bind(snd_handle_chordal_input,                      KeyCode_C);
+        Bind(snd_handle_chordal_input,                      KeyCode_0);
+        Bind(snd_handle_chordal_input,                      KeyCode_4, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_5, KeyCode_Shift);
+
         Bind(move_up,                                       KeyCode_K);
         Bind(move_up_to_blank_line_end,                     KeyCode_K, KeyCode_Control);
         Bind(snd_move_line_up,                              KeyCode_K, KeyCode_Alt);
@@ -1131,23 +1236,15 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_new_line_above,                            KeyCode_O, KeyCode_Shift);
         Bind(interactive_open_or_new,                       KeyCode_O, KeyCode_Control);
         Bind(move_right,                                    KeyCode_L);
-
-        // @TODO: These moves are totally not right
-        Bind(snd_do_word_motion_right,                           KeyCode_W);
-        Bind(move_right_whitespace_boundary,                KeyCode_W, KeyCode_Shift);
-        Bind(snd_do_word_motion_left,                            KeyCode_B);
-        Bind(move_left_whitespace_boundary,                 KeyCode_B, KeyCode_Shift);
-
         Bind(snd_move_right_token_end,                      KeyCode_E);
         Bind(page_up,                                       KeyCode_B, KeyCode_Control);
         Bind(page_down,                                     KeyCode_F, KeyCode_Control);
-        Bind(keyboard_macro_replay,                         KeyCode_Period);
+        Bind(snd_repeat_most_recent_command,                KeyCode_Period);
         Bind(set_mark,                                      KeyCode_V);
         Bind(snd_select_line,                               KeyCode_V, KeyCode_Shift);
         Bind(delete_char,                                   KeyCode_X);
-        Bind(snd_cut,                                       KeyCode_D);
-        Bind(snd_push_change,                                    KeyCode_C);
-        // Bind(snd_change_word,                               KeyCode_C, KeyCode_Shift);
+        Bind(snd_inclusive_cut,                             KeyCode_D, KeyCode_Shift);
+        Bind(snd_change,                                    KeyCode_C, KeyCode_Shift);
         Bind(copy,                                          KeyCode_Y);
         Bind(paste_and_indent,                              KeyCode_P);
         Bind(goto_line,                                     KeyCode_G);
@@ -1156,8 +1253,6 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(search,                                        KeyCode_ForwardSlash);
         Bind(undo,                                          KeyCode_U);
         Bind(redo,                                          KeyCode_R, KeyCode_Control);
-        Bind(seek_beginning_of_line,                        KeyCode_0);
-        Bind(seek_end_of_line,                              KeyCode_4, KeyCode_Shift);
         Bind(command_lister,                                KeyCode_Semicolon, KeyCode_Shift);
         Bind(snd_exit_command_mode,                         KeyCode_I);
         Bind(snd_append,                                    KeyCode_A);
@@ -1188,6 +1283,7 @@ void custom_layer_init(Application_Links *app) {
 
     set_custom_hook(app, HookID_RenderCaller, snd_render_caller);
     set_custom_hook(app, HookID_BeginBuffer, snd_begin_buffer);
+    set_custom_hook(app, HookID_ViewEventHandler, snd_view_input_handler);
 
     mapping_init(tctx, &framework_mapping);
     snd_setup_mapping(&framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_command_mode);
