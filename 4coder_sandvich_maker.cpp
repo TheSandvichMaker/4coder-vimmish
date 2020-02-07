@@ -23,28 +23,55 @@ inline Snd_Motion_Result snd_null_motion(i64 pos) {
     return result;
 }
 
-#define SND_MOTION(name) Snd_Motion_Result name(Application_Links* app, Buffer_ID buffer, i64 start_pos)
-typedef SND_MOTION(Snd_Motion);
+enum Snd_Text_Motion {
+    SndTextMotion_None,
 
-#define SND_ACTION(name) void name(Application_Links* app, Snd_Motion_Result mr)
-typedef SND_ACTION(Snd_Action);
+    SndTextMotion_Word,
+    SndTextMotion_WordEnd,
+    SndTextMotion_LineSide,
+    SndTextMotion_Scope,
+};
 
-struct Snd_Command {
-    Snd_Action* action;
-    Snd_Motion* motion;
+enum Snd_Text_Action {
+    SndTextAction_None,
+
+    SndTextAction_Cut,
+    SndTextAction_Change,
+};
+
+enum Snd_Window_Action {
+    SndWindowAction_None,
+
+    SndWindowAction_Cycle,
+    SndWindowAction_Left,
+    SndWindowAction_Right,
+    SndWindowAction_Up,
+    SndWindowAction_Down,
+    SndWindowAction_Swap,
+    SndWindowAction_VSplit,
+    SndWindowAction_HSplit,
+};
+
+struct Snd_Text_Command {
+    History_Record_Index history_record_index;
+
+    Snd_Text_Action action;
+    Snd_Text_Motion motion;
+    Scan_Direction motion_direction;
     i32 motion_count;
 };
 
-inline b32 snd_command_is_valid(Snd_Command command) {
-    b32 result = (command.motion && command.motion_count > 0);
+inline b32 snd_text_command_is_valid(Snd_Text_Command command) {
+    b32 result = (command.motion != SndTextMotion_None && command.motion_count > 0);
     return result;
 }
 
-Snd_Command snd_most_recent_command;
+Snd_Text_Command snd_most_recent_text_command;
 
 enum Snd_Buffer_Flag {
     SndBufferFlag_TreatAsCode = 0x1,
     SndBufferFlag_Append = 0x2,
+    SndBufferFlag_BegunHistoryGroup = 0x4,
 };
 
 #if 0
@@ -62,108 +89,12 @@ struct Snd_Buffer_Attachment {
     u32 flags;
     i64 cursor_pos_on_append;
 
-    History_Group insert_history;
+    History_Group history;
 };
 
 //
 // @Note: Hooks and such
 //
-
-CUSTOM_COMMAND_SIG(snd_view_input_handler)
-CUSTOM_DOC("Input consumption loop for default view behavior")
-{
-    Thread_Context *tctx = get_thread_context(app);
-    Scratch_Block scratch(tctx);
-
-    {
-        View_ID view = get_this_ctx_view(app, Access_Always);
-        String_Const_u8 name = push_u8_stringf(scratch, "view %d", view);
-
-        Profile_Global_List *list = get_core_profile_list(app);
-        ProfileThreadName(tctx, list, name);
-
-        View_Context ctx = view_current_context(app, view);
-        ctx.mapping = &framework_mapping;
-        ctx.map_id = mapid_global;
-        view_alter_context(app, view, &ctx);
-    }
-
-    for (;;){
-        // NOTE(allen): Get the binding from the buffer's current map
-        User_Input input = get_next_input(app, EventPropertyGroup_Any, 0);
-        ProfileScopeNamed(app, "before view input", view_input_profile);
-        if (input.abort){
-            break;
-        }
-
-        Event_Property event_properties = get_event_properties(&input.event);
-
-        if (suppressing_mouse && (event_properties & EventPropertyGroup_AnyMouseEvent) != 0){
-            continue;
-        }
-
-        View_ID view = get_this_ctx_view(app, Access_Always);
-
-        Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
-        Managed_Scope buffer_scope = buffer_get_managed_scope(app, buffer);
-        Command_Map_ID *map_id_ptr = scope_attachment(app, buffer_scope, buffer_map_id, Command_Map_ID);
-        if (*map_id_ptr == 0){
-            *map_id_ptr = mapid_file;
-        }
-        Command_Map_ID map_id = *map_id_ptr;
-
-        Command_Binding binding = map_get_binding_recursive(&framework_mapping, map_id, &input.event);
-
-        Managed_Scope scope = view_get_managed_scope(app, view);
-
-        if (binding.custom == 0){
-            // NOTE(allen): we don't have anything to do with this input,
-            // leave it marked unhandled so that if there's a follow up
-            // event it is not blocked.
-            leave_current_input_unhandled(app);
-        }
-        else{
-            // NOTE(allen): before the command is called do some book keeping
-            Rewrite_Type *next_rewrite = scope_attachment(app, scope, view_next_rewrite_loc, Rewrite_Type);
-            *next_rewrite = Rewrite_None;
-            if (fcoder_mode == FCoderMode_NotepadLike){
-                for (View_ID view_it = get_view_next(app, 0, Access_Always);
-                     view_it != 0;
-                     view_it = get_view_next(app, view_it, Access_Always)){
-                    Managed_Scope scope_it = view_get_managed_scope(app, view_it);
-                    b32 *snap_mark_to_cursor = scope_attachment(app, scope_it, view_snap_mark_to_cursor, b32);
-                    *snap_mark_to_cursor = true;
-                }
-            }
-
-            ProfileCloseNow(view_input_profile);
-
-            // NOTE(allen): call the command
-            binding.custom(app);
-
-            // NOTE(allen): after the command is called do some book keeping
-            ProfileScope(app, "after view input");
-
-            next_rewrite = scope_attachment(app, scope, view_next_rewrite_loc, Rewrite_Type);
-            if (next_rewrite != 0){
-                Rewrite_Type *rewrite = scope_attachment(app, scope, view_rewrite_loc, Rewrite_Type);
-                *rewrite = *next_rewrite;
-                if (fcoder_mode == FCoderMode_NotepadLike){
-                    for (View_ID view_it = get_view_next(app, 0, Access_Always);
-                         view_it != 0;
-                         view_it = get_view_next(app, view_it, Access_Always)){
-                        Managed_Scope scope_it = view_get_managed_scope(app, view_it);
-                        b32 *snap_mark_to_cursor = scope_attachment(app, scope_it, view_snap_mark_to_cursor, b32);
-                        if (*snap_mark_to_cursor){
-                            i64 pos = view_get_cursor_pos(app, view_it);
-                            view_set_mark(app, view_it, seek_pos(pos));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 function void snd_draw_cursor(Application_Links *app, View_ID view_id, b32 is_active_view, Buffer_ID buffer, Text_Layout_ID text_layout_id, f32 roundness, f32 outline_thickness, b32 in_command_mode) {
     b32 has_highlight_range = draw_highlight_range(app, view_id, buffer, text_layout_id, roundness);
@@ -273,61 +204,6 @@ function void snd_render_buffer(Application_Links *app, View_ID view_id, Face_ID
     draw_set_clip(app, prev_clip);
 }
 
-function void snd_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_ID buffer, Face_ID face_id, Rect_f32 bar) {
-    Scratch_Block scratch(app);
-
-    draw_rectangle_fcolor(app, bar, 0.f, fcolor_id(defcolor_bar));
-
-    FColor base_color = fcolor_id(defcolor_base);
-    FColor pop2_color = fcolor_id(defcolor_pop2);
-
-    i64 cursor_position = view_get_cursor_pos(app, view_id);
-    Buffer_Cursor cursor = view_compute_cursor(app, view_id, seek_pos(cursor_position));
-
-    Fancy_Line list = {};
-    String_Const_u8 unique_name = push_buffer_unique_name(app, scratch, buffer);
-    push_fancy_string(scratch, &list, base_color, unique_name);
-    push_fancy_stringf(scratch, &list, base_color, " - Row: %3.lld Col: %3.lld -", cursor.line, cursor.col);
-
-    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
-    Line_Ending_Kind *eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
-    switch (*eol_setting){
-        case LineEndingKind_Binary:
-        {
-            push_fancy_string(scratch, &list, base_color, string_u8_litexpr(" bin"));
-        }break;
-
-        case LineEndingKind_LF:
-        {
-            push_fancy_string(scratch, &list, base_color, string_u8_litexpr(" lf"));
-        }break;
-
-        case LineEndingKind_CRLF:
-        {
-            push_fancy_string(scratch, &list, base_color, string_u8_litexpr(" crlf"));
-        }break;
-    }
-
-    {
-        Dirty_State dirty = buffer_get_dirty_state(app, buffer);
-        u8 space[3];
-        String_u8 str = Su8(space, 0, 3);
-        if (dirty != 0){
-            string_append(&str, string_u8_litexpr(" "));
-        }
-        if (HasFlag(dirty, DirtyState_UnsavedChanges)){
-            string_append(&str, string_u8_litexpr("*"));
-        }
-        if (HasFlag(dirty, DirtyState_UnloadedChanges)){
-            string_append(&str, string_u8_litexpr("!"));
-        }
-        push_fancy_string(scratch, &list, pop2_color, str.string);
-    }
-
-    Vec2_f32 p = bar.p0 + V2f32(2.f, 2.f);
-    draw_fancy_line(app, face_id, fcolor_zero(), &list, p);
-}
-
 function void snd_render_caller(Application_Links *app, Frame_Info frame_info, View_ID view_id) {
     ProfileScope(app, "default render caller");
     View_ID active_view = get_active_view(app, Access_Always);
@@ -346,8 +222,7 @@ function void snd_render_caller(Application_Links *app, Frame_Info frame_info, V
     b64 showing_file_bar = false;
     if (view_get_setting(app, view_id, ViewSetting_ShowFileBar, &showing_file_bar) && showing_file_bar){
         Rect_f32_Pair pair = layout_file_bar_on_top(region, line_height);
-        // NOTE(snd): Custom file bar
-        snd_draw_file_bar(app, view_id, buffer, face_id, pair.min);
+        draw_file_bar(app, view_id, buffer, face_id, pair.min);
         region = pair.max;
     }
 
@@ -427,7 +302,7 @@ BUFFER_HOOK_SIG(snd_begin_buffer) {
                     string_match(ext, string_u8_litexpr("c"))   ||
                     string_match(ext, string_u8_litexpr("hpp")) ||
                     string_match(ext, string_u8_litexpr("cc"))
-                    ) {
+                ) {
                     treat_as_code = true;
                 }
 
@@ -535,6 +410,35 @@ CUSTOM_COMMAND_SIG(snd_move_right_on_line) {
     }
 }
 
+inline History_Group* snd_begin_history_group_for_buffer(Application_Links* app, History_Group history) {
+    Managed_Scope scope = buffer_get_managed_scope(app, history.buffer);
+    Snd_Buffer_Attachment* snd_buffer = scope_attachment(app, scope, snd_buffer_attachment, Snd_Buffer_Attachment);
+
+    if (!(snd_buffer->flags & SndBufferFlag_BegunHistoryGroup)) {
+        snd_buffer->history = history;
+        snd_buffer->flags |= SndBufferFlag_BegunHistoryGroup;
+    } else {
+        print_message(app, string_u8_litexpr("Warning: Tried to open history group for buffer when there's already one open"));
+    }
+
+    return &snd_buffer->history;
+}
+
+inline History_Group* snd_begin_history_group_for_buffer(Application_Links* app, Buffer_ID buffer) {
+    return snd_begin_history_group_for_buffer(app, history_group_begin(app, buffer));
+}
+
+inline void snd_end_history_group_for_buffer(Application_Links* app, Buffer_ID buffer) {
+    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
+    Snd_Buffer_Attachment* snd_buffer = scope_attachment(app, scope, snd_buffer_attachment, Snd_Buffer_Attachment);
+    if (snd_buffer->flags & SndBufferFlag_BegunHistoryGroup) {
+        history_group_end(snd_buffer->history);
+        snd_buffer->flags &= ~SndBufferFlag_BegunHistoryGroup;
+    } else {
+        print_message(app, string_u8_litexpr("Warning: Tried to end history group for buffer when there isn't one open"));
+    }
+}
+
 CUSTOM_COMMAND_SIG(snd_enter_command_mode)
 {
     View_ID view = get_active_view(app, Access_ReadVisible);
@@ -553,14 +457,14 @@ CUSTOM_COMMAND_SIG(snd_enter_command_mode)
         snd_buffer->flags &= ~SndBufferFlag_Append;
     }
 
-    history_group_end(snd_buffer->insert_history);
-
-    keyboard_macro_finish_recording(app);
+    if (snd_buffer->flags & SndBufferFlag_BegunHistoryGroup) {
+        snd_end_history_group_for_buffer(app, buffer);
+    }
 }
 
-internal void snd_exit_command_mode_internal(Application_Links* app, History_Group history) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+CUSTOM_COMMAND_SIG(snd_exit_command_mode) {
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Command_Map_ID* map_id_ptr = scope_attachment(app, scope, buffer_map_id, Command_Map_ID);
 
@@ -571,22 +475,16 @@ internal void snd_exit_command_mode_internal(Application_Links* app, History_Gro
         *map_id_ptr = mapid_file;
     }
 
-    snd_buffer->insert_history = history;
+    if (!(snd_buffer->flags & SndBufferFlag_BegunHistoryGroup)) {
+        snd_begin_history_group_for_buffer(app, buffer);
+    }
 
     keyboard_macro_start_recording(app);
 }
 
-CUSTOM_COMMAND_SIG(snd_exit_command_mode)
-{
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
-
-    snd_exit_command_mode_internal(app, history_group_begin(app, buffer));
-}
-
 internal void snd_enter_append_mode(Application_Links* app) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Snd_Buffer_Attachment* snd_buffer = scope_attachment(app, scope, snd_buffer_attachment, Snd_Buffer_Attachment);
 
@@ -606,6 +504,7 @@ CUSTOM_COMMAND_SIG(snd_append_to_line_end) {
     snd_enter_append_mode(app);
 }
 
+#if 0
 CUSTOM_COMMAND_SIG(snd_move_right_token_end)
 {
     // @TODO: Isn't this too complex and weird?
@@ -626,6 +525,7 @@ CUSTOM_COMMAND_SIG(snd_move_right_token_end)
         view_set_cursor_by_character_delta(app, view, -1);
     }
 }
+#endif
 
 CUSTOM_COMMAND_SIG(snd_inclusive_cut) {
     move_right(app);
@@ -636,42 +536,90 @@ CUSTOM_COMMAND_SIG(snd_change) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-    History_Group history = history_group_begin(app, buffer);
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
+
+    snd_begin_history_group_for_buffer(app, buffer);
 
     snd_inclusive_cut(app);
 
-    snd_exit_command_mode_internal(app, history);
+    snd_exit_command_mode(app);
+}
+
+internal void snd_write_text_and_auto_indent(Application_Links* app, String_Const_u8 insert) {
+    if (insert.str != 0 && insert.size > 0){
+        b32 do_auto_indent = false;
+        for (u64 i = 0; !do_auto_indent && i < insert.size; i += 1){
+            switch (insert.str[i]){
+                case ';': case ':':
+                case '{': case '}':
+                case '(': case ')':
+                case '[': case ']':
+                case '#':
+                case '\n': case '\t':
+                {
+                    do_auto_indent = true;
+                }break;
+            }
+        }
+        if (do_auto_indent){
+            View_ID view = get_active_view(app, Access_ReadWriteVisible);
+            Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+            Range_i64 pos = {};
+            pos.min = view_get_cursor_pos(app, view);
+            write_text(app, insert);
+            pos.max= view_get_cursor_pos(app, view);
+            auto_indent_buffer(app, buffer, pos, 0);
+            move_past_lead_whitespace(app, view, buffer);
+        }
+        else{
+            write_text(app, insert);
+        }
+    }
 }
 
 CUSTOM_COMMAND_SIG(snd_new_line_below) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
-    History_Group history = history_group_begin(app, buffer);
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
+
+    snd_begin_history_group_for_buffer(app, buffer);
 
     seek_end_of_line(app);
-    write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+    snd_write_text_and_auto_indent(app, string_u8_litexpr("\n"));
 
-    snd_exit_command_mode_internal(app, history);
+    snd_exit_command_mode(app);
 }
 
 CUSTOM_COMMAND_SIG(snd_new_line_above) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
 
     // TODO(snd): Why does this not restore the cursor to the right position?
-    History_Group history = history_group_begin(app, buffer);
+    snd_begin_history_group_for_buffer(app, buffer);
 
     seek_beginning_of_line(app);
     move_left(app);
-    write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+    snd_write_text_and_auto_indent(app, string_u8_litexpr("\n"));
 
-    snd_exit_command_mode_internal(app, history);
+    snd_exit_command_mode(app);
 }
 
 CUSTOM_COMMAND_SIG(snd_join_line) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
 
     i64 pos = view_get_cursor_pos(app, view);
     i64 line = get_line_number_from_pos(app, buffer, pos);
@@ -694,8 +642,12 @@ CUSTOM_COMMAND_SIG(snd_join_line) {
 }
 
 CUSTOM_COMMAND_SIG(snd_move_line_down) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
 
     i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
     move_line(app, buffer, line, Scan_Forward);
@@ -713,8 +665,12 @@ CUSTOM_DOC("Moves up to the next line of actual text, regardless of line wrappin
 }
 
 CUSTOM_COMMAND_SIG(snd_move_line_up) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
 
     i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
     move_line(app, buffer, line, Scan_Backward);
@@ -744,191 +700,198 @@ internal i64 snd_boundary_word(Application_Links* app, Buffer_ID buffer, Side si
     return result;
 }
 
-internal Snd_Motion_Result snd_word_motion_internal(Application_Links* app, Buffer_ID buffer, Scan_Direction dir, i64 pos) {
-    Scratch_Block scratch(app);
+internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, Scan_Direction dir, Snd_Text_Action associated_action, i32 motion_count, Snd_Text_Motion motion) {
+    Snd_Motion_Result outer_result = { Ii64_neg_inf, start_pos };
 
-    Snd_Motion_Result result = snd_null_motion(pos);
+    for (i32 motion_index = 0; motion_index < motion_count; motion_index++) {
+        Snd_Motion_Result inner_result = snd_null_motion(start_pos);
 
-    i64 start_pos = pos;
-    i64 end_pos   = pos;
+        switch (motion) {
+            case SndTextMotion_Word: {
+                // @TODO: Simplify this, figure out how it should _really_ work
+                Scratch_Block scratch(app);
 
-    if (dir == Scan_Forward) {
-        if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, pos))) {
-            i64 next_line = get_line_number_from_pos(app, buffer, pos) + 1;
-            i64 next_line_start = get_pos_past_lead_whitespace_from_line_number(app, buffer, next_line);
+                i64 end_pos = start_pos;
 
-            end_pos = next_line_start;
-        } else {
-            end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Forward, end_pos);
+                if (dir == Scan_Forward) {
+                    if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, end_pos))) {
+                        i64 next_line = get_line_number_from_pos(app, buffer, end_pos) + 1;
+                        i64 next_line_start = get_pos_past_lead_whitespace_from_line_number(app, buffer, next_line);
 
-            u8 c_at_cursor = buffer_get_char(app, buffer, end_pos);
-            if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
-                end_pos = scan(app, push_boundary_list(scratch, boundary_whitespace, boundary_line), buffer, Scan_Forward, end_pos);
-            }
-        }
-    } else {
-        if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, pos))) {
-            i64 next_line = get_line_number_from_pos(app, buffer, pos) - 1;
-            i64 next_line_end = get_line_end_pos(app, buffer, next_line);
+                        end_pos = next_line_start;
+                    } else {
+                        end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Forward, end_pos);
 
-            end_pos = next_line_end;
-        } else {
-            end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Backward, end_pos);
-
-            u8 c_at_cursor = buffer_get_char(app, buffer, end_pos);
-            if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
-                end_pos = scan(app, push_boundary_list(scratch, boundary_whitespace, boundary_line), buffer, Scan_Backward, end_pos);
-            }
-        }
-    }
-
-    result.seek_pos = end_pos;
-    result.range = Ii64(start_pos, end_pos);
-    return result;
-}
-
-internal SND_MOTION(snd_word_motion_right) {
-    return snd_word_motion_internal(app, buffer, Scan_Forward, start_pos);
-}
-
-internal SND_MOTION(snd_word_motion_left) {
-    return snd_word_motion_internal(app, buffer, Scan_Backward, start_pos);
-}
-
-internal Snd_Motion_Result snd_line_side_motion_internal(Application_Links* app, Buffer_ID buffer, Scan_Direction dir, i64 pos) {
-    Snd_Motion_Result result;
-    result.range = Ii64(pos, get_line_side_pos_from_pos(app, buffer, pos, dir == Scan_Forward ? Side_Max : Side_Min));
-    result.seek_pos = (dir == Scan_Forward) ? result.range.max : result.range.min;
-
-    return result;
-}
-
-internal SND_MOTION(snd_line_side_motion_right) {
-    return snd_line_side_motion_internal(app, buffer, Scan_Forward, start_pos);
-}
-
-internal SND_MOTION(snd_line_side_motion_left) {
-    return snd_line_side_motion_internal(app, buffer, Scan_Backward, start_pos);
-}
-
-internal SND_MOTION(snd_scope_motion) {
-    Snd_Motion_Result result = snd_null_motion(start_pos);
-
-    Token_Array token_array = get_token_array_from_buffer(app, buffer);
-    if (token_array.count > 0) {
-        Token_Base_Kind opening_token = TokenBaseKind_EOF;
-        Range_i64 line_range = get_line_pos_range(app, buffer, get_line_number_from_pos(app, buffer, start_pos));
-        Token_Iterator_Array it = token_iterator_pos(0, &token_array, start_pos);
-
-        b32 loop = true;
-        while (loop && opening_token == TokenBaseKind_EOF) {
-            Token* token = token_it_read(&it);
-            if (range_contains_inclusive(line_range, token->pos)) {
-                switch (token->kind) {
-                    case TokenBaseKind_ParentheticalOpen:
-                    case TokenBaseKind_ScopeOpen:
-                    case TokenBaseKind_ParentheticalClose:
-                    case TokenBaseKind_ScopeClose: {
-                        opening_token = token->kind;
-                    } break;
-
-                    default: {
-                        loop = token_it_inc(&it);
-                    } break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        if (opening_token != TokenBaseKind_EOF) {
-            b32 scan_forward = (opening_token == TokenBaseKind_ScopeOpen || opening_token == TokenBaseKind_ParentheticalOpen);
-
-            Token_Base_Kind closing_token = TokenBaseKind_EOF;
-            if (opening_token == TokenBaseKind_ParentheticalOpen)  closing_token = TokenBaseKind_ParentheticalClose;
-            if (opening_token == TokenBaseKind_ParentheticalClose) closing_token = TokenBaseKind_ParentheticalOpen;
-            if (opening_token == TokenBaseKind_ScopeOpen)          closing_token = TokenBaseKind_ScopeClose;
-            if (opening_token == TokenBaseKind_ScopeClose)         closing_token = TokenBaseKind_ScopeOpen;
-
-            i32 scope_depth = 1;
-            for (;;) {
-                b32 tokens_left = scan_forward ? token_it_inc(&it) : token_it_dec(&it);
-                if (tokens_left) {
-                    Token* token = token_it_read(&it);
-
-                    if (token->kind == opening_token) {
-                        scope_depth++;
-                    } else if (token->kind == closing_token) {
-                        scope_depth--;
+                        u8 c_at_cursor = buffer_get_char(app, buffer, end_pos);
+                        if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
+                            end_pos = scan(app, push_boundary_list(scratch, boundary_whitespace, boundary_line), buffer, Scan_Forward, end_pos);
+                        }
                     }
 
-                    if (scope_depth == 0) {
-                        i64 end_pos = token->pos;
-                        if (scan_forward) {
-                            end_pos += token->size - 1;
-                        }
-
-                        result.seek_pos = end_pos;
-                        result.range = Ii64(start_pos, end_pos);
-
-                        break;
+                    if (associated_action) {
+                        // @Note: To mimic vim behaviour, we'll have to slice off one character from the end when using word motion for text actions
+                        end_pos--;
                     }
                 } else {
-                    break;
+                    if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, end_pos))) {
+                        i64 next_line = get_line_number_from_pos(app, buffer, end_pos) - 1;
+                        i64 next_line_end = get_line_end_pos(app, buffer, next_line);
+
+                        end_pos = next_line_end;
+                    } else {
+                        end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Backward, end_pos);
+
+                        u8 c_at_cursor = buffer_get_char(app, buffer, end_pos);
+                        if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
+                            end_pos = scan(app, push_boundary_list(scratch, boundary_whitespace, boundary_line), buffer, Scan_Backward, end_pos);
+                        }
+                    }
                 }
-            }
+
+                inner_result.seek_pos = end_pos;
+                inner_result.range = Ii64(start_pos, end_pos);
+            } break;
+
+            case SndTextMotion_WordEnd: {
+                Scratch_Block scratch(app);
+                // @TODO: Use consistent word definition
+                inner_result.seek_pos = scan(app, push_boundary_list(scratch, boundary_token), buffer, Scan_Forward, start_pos + 1) - 1; // @Unicode
+                inner_result.range = Ii64(start_pos, inner_result.seek_pos);
+            } break;
+
+            case SndTextMotion_LineSide: {
+                inner_result.range = Ii64(start_pos, get_line_side_pos_from_pos(app, buffer, start_pos, dir == Scan_Forward ? Side_Max : Side_Min));
+                inner_result.seek_pos = (dir == Scan_Forward) ? inner_result.range.max : inner_result.range.min;
+            } break;
+
+            case SndTextMotion_Scope: {
+                Token_Array token_array = get_token_array_from_buffer(app, buffer);
+                if (token_array.count > 0) {
+                    Token_Base_Kind opening_token = TokenBaseKind_EOF;
+                    Range_i64 line_range = get_line_pos_range(app, buffer, get_line_number_from_pos(app, buffer, start_pos));
+                    Token_Iterator_Array it = token_iterator_pos(0, &token_array, start_pos);
+
+                    b32 loop = true;
+                    while (loop && opening_token == TokenBaseKind_EOF) {
+                        Token* token = token_it_read(&it);
+                        if (range_contains_inclusive(line_range, token->pos)) {
+                            switch (token->kind) {
+                                case TokenBaseKind_ParentheticalOpen:
+                                case TokenBaseKind_ScopeOpen:
+                                case TokenBaseKind_ParentheticalClose:
+                                case TokenBaseKind_ScopeClose: {
+                                    opening_token = token->kind;
+                                } break;
+
+                                default: {
+                                    loop = token_it_inc(&it);
+                                } break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if (opening_token != TokenBaseKind_EOF) {
+                        b32 scan_forward = (opening_token == TokenBaseKind_ScopeOpen || opening_token == TokenBaseKind_ParentheticalOpen);
+
+                        Token_Base_Kind closing_token = TokenBaseKind_EOF;
+                        if (opening_token == TokenBaseKind_ParentheticalOpen)  closing_token = TokenBaseKind_ParentheticalClose;
+                        if (opening_token == TokenBaseKind_ParentheticalClose) closing_token = TokenBaseKind_ParentheticalOpen;
+                        if (opening_token == TokenBaseKind_ScopeOpen)          closing_token = TokenBaseKind_ScopeClose;
+                        if (opening_token == TokenBaseKind_ScopeClose)         closing_token = TokenBaseKind_ScopeOpen;
+
+                        i32 scope_depth = 1;
+                        for (;;) {
+                            b32 tokens_left = scan_forward ? token_it_inc(&it) : token_it_dec(&it);
+                            if (tokens_left) {
+                                Token* token = token_it_read(&it);
+
+                                if (token->kind == opening_token) {
+                                    scope_depth++;
+                                } else if (token->kind == closing_token) {
+                                    scope_depth--;
+                                }
+
+                                if (scope_depth == 0) {
+                                    i64 end_pos = token->pos;
+                                    if (scan_forward) {
+                                        end_pos += token->size - 1;
+                                    }
+
+                                    inner_result.seek_pos = end_pos;
+                                    inner_result.range = Ii64(start_pos, end_pos);
+
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } break;
         }
+
+        outer_result = { range_union(outer_result.range, inner_result.range), inner_result.seek_pos };
     }
 
-    return result;
-}
-
-internal Snd_Motion_Result snd_execute_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, i32 motion_count, Snd_Motion* motion) {
-    Snd_Motion_Result result = { Ii64_neg_inf, start_pos };
-    for (i32 motion_index = 0; motion_index < motion_count; motion_index++) {
-        Snd_Motion_Result inner_result = motion(app, buffer, result.seek_pos);
-        result = { range_union(result.range, inner_result.range), inner_result.seek_pos };
-    }
-    return result;
+    return outer_result;
 }
 
 internal void snd_cut_range_inclusive(Application_Links* app, View_ID view, Buffer_ID buffer, Range_i64 range) {
-    History_Group history = history_group_begin(app, buffer);
-
     view_set_cursor(app, view, seek_pos(range.min));
     view_set_mark(app, view, seek_pos(range.max + 1));
 
     cut(app);
 }
 
-internal SND_ACTION(snd_cut_action) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+internal void snd_execute_text_action(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Text_Action action, Snd_Motion_Result mr) {
+    switch (action) {
+        case SndTextAction_Cut: {
+            snd_cut_range_inclusive(app, view, buffer, mr.range);
+            snd_end_history_group_for_buffer(app, buffer);
+        } break;
 
-    snd_cut_range_inclusive(app, view, buffer, mr.range);
+        case SndTextAction_Change: {
+            snd_cut_range_inclusive(app, view, buffer, mr.range);
+            snd_exit_command_mode(app);
+        } break;
+    }
 }
 
-internal SND_ACTION(snd_change_action) {
-    View_ID view = get_active_view(app, Access_ReadVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+inline void snd_execute_text_command(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Text_Command command) {
+    if (command.motion) {
+        Snd_Motion_Result mr = snd_execute_text_motion(app, buffer, view_get_cursor_pos(app, view), command.motion_direction, command.action, command.motion_count, command.motion);
+        u32 buffer_flags = buffer_get_access_flags(app, buffer);
+        if (command.action && (buffer_flags & Access_Write)) {
+            snd_most_recent_text_command = command;
 
-    History_Group history = history_group_begin(app, buffer);
+            History_Group* history = snd_begin_history_group_for_buffer(app, buffer);
+            if (!snd_most_recent_text_command.history_record_index) {
+                snd_most_recent_text_command.history_record_index = history->first;
+            }
 
-    snd_cut_range_inclusive(app, view, buffer, mr.range);
-
-    snd_exit_command_mode_internal(app, history);
+            snd_execute_text_action(app, view, buffer, command.action, mr);
+        } else {
+            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
+        }
+    }
 }
 
 internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
 
-    i32 motion_count = -1;
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
 
-    b32 action_is_one_shy = false;
-    b32 only_range_is_one_shy = false;
-    Snd_Action* action = 0;
-    Snd_Motion* motion = 0;
+    b32 is_window_command = false;
+    Snd_Window_Action window_action = SndWindowAction_None;
+
+    Snd_Text_Command text_command = {};
+    text_command.motion_direction = Scan_Forward;
 
     User_Input in = get_current_input(app);
 
@@ -937,18 +900,18 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             break;
         }
 
-        Snd_Action* entered_action = 0;
+        Snd_Text_Action entered_action = SndTextAction_None;
         if (match_key_code(&in, KeyCode_C)) {
-            entered_action = snd_change_action;
+            entered_action = SndTextAction_Change;
         } else if (match_key_code(&in, KeyCode_D)) {
-            entered_action = snd_cut_action;
+            entered_action = SndTextAction_Cut;
         }
 
         if (entered_action) {
-            if (!action) {
-                action = entered_action;
+            if (!text_command.action) {
+                text_command.action = entered_action;
             } else {
-                if (action == entered_action) {
+                if (text_command.action == entered_action) {
                     // @Incomplete: Do the right behaviour
                     break;
                 } else {
@@ -958,30 +921,48 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
         }
 
         if (!entered_action) {
-            Snd_Motion* entered_motion = 0;
-            if (match_key_code(&in, KeyCode_W)) {
-                entered_motion = snd_word_motion_right;
-                action_is_one_shy = true;
+            if (match_key_code(&in, KeyCode_W) && has_modifier(&in, KeyCode_Control)) {
+                if (is_window_command) {
+                    window_action = SndWindowAction_Cycle;
+                }
+                is_window_command = true;
+            } else if (match_key_code(&in, KeyCode_H)) {
+                window_action = SndWindowAction_Left;
+            } else if (match_key_code(&in, KeyCode_J)) {
+                window_action = SndWindowAction_Down;
+            } else if (match_key_code(&in, KeyCode_K)) {
+                window_action = SndWindowAction_Up;
+            } else if (match_key_code(&in, KeyCode_L)) {
+                window_action = SndWindowAction_Right;
+            } else if (match_key_code(&in, KeyCode_V)) {
+                window_action = SndWindowAction_VSplit;
+            } else if (match_key_code(&in, KeyCode_S)) {
+                window_action = SndWindowAction_HSplit;
+            } else if (match_key_code(&in, KeyCode_X)) {
+                window_action = SndWindowAction_Swap;
+            } else if (match_key_code(&in, KeyCode_W)) {
+                text_command.motion = SndTextMotion_Word;
+            } else if (match_key_code(&in, KeyCode_E)) {
+                text_command.motion = SndTextMotion_WordEnd;
             } else if (match_key_code(&in, KeyCode_B)) {
-                entered_motion = snd_word_motion_left;
+                text_command.motion = SndTextMotion_Word;
+                text_command.motion_direction = Scan_Backward;
             } else if (match_key_code(&in, KeyCode_0)) {
-                entered_motion = snd_line_side_motion_left;
-                action_is_one_shy = true;
-                only_range_is_one_shy = true;
+                text_command.motion = SndTextMotion_LineSide;
+                text_command.motion_direction = Scan_Backward;
             } else if (match_key_code(&in, KeyCode_4) && has_modifier(&in, KeyCode_Shift)) {
-                entered_motion = snd_line_side_motion_right;
-                action_is_one_shy = true;
+                text_command.motion = SndTextMotion_LineSide;
             } else if (match_key_code(&in, KeyCode_5) && has_modifier(&in, KeyCode_Shift)) {
-                entered_motion = snd_scope_motion;
+                text_command.motion = SndTextMotion_Scope;
             } else {
                 String_Const_u8 in_string = to_writable(&in);
                 if (in_string.size) {
                     if (string_is_integer(in_string, 10)) {
                         i32 count = cast(i32) string_to_integer(in_string, 10);
-                        if (motion_count < 0) {
-                            motion_count = count;
+                        if (text_command.motion_count < 0) {
+                            text_command.motion_count = count;
                         } else {
-                            motion_count = 10*motion_count + count;
+                            text_command.motion_count = 10*text_command.motion_count + count;
                         }
                     } else {
                         leave_current_input_unhandled(app);
@@ -992,8 +973,7 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
                 }
             }
 
-            if (entered_motion) {
-                motion = entered_motion;
+            if (text_command.motion || (is_window_command && window_action)) {
                 break;
             }
         }
@@ -1001,48 +981,38 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
         in = get_next_input(app, EventPropertyGroup_AnyKeyboardEvent, EventProperty_Escape|EventProperty_ViewActivation);
     }
 
-    if (motion_count < 0) {
-        motion_count = 1;
+    if (!text_command.motion_count) {
+        text_command.motion_count = 1;
     }
 
-    if (motion) {
-        Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), motion_count, motion);
-        if (action) {
-            if (action_is_one_shy) {
-                // @Unicode!!
-                if (mr.range.max - mr.range.min > 1) {
-                    mr.range.max--;
-                    if (!only_range_is_one_shy) {
-                        mr.seek_pos--;
-                    }
-                }
-            }
-
-            snd_most_recent_command = { action, motion, motion_count };
-            action(app, mr);
-        } else {
-            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
+    if (is_window_command) {
+        Panel_ID panel = view_get_panel(app, view);
+        switch (window_action) {
+            case SndWindowAction_Cycle: { change_active_panel(app); } break;
+            case SndWindowAction_HSplit: { panel_split(app, panel, Dimension_Y); } break;
+            case SndWindowAction_VSplit: { panel_split(app, panel, Dimension_X); } break;
+            case SndWindowAction_Swap: { swap_panels(app); } break;
         }
+    } else {
+        snd_execute_text_command(app, view, buffer, text_command);
     }
 }
 
 CUSTOM_COMMAND_SIG(snd_repeat_most_recent_command) {
-    if (snd_command_is_valid(snd_most_recent_command)) {
-        View_ID view = get_active_view(app, Access_ReadVisible);
-        Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+    if (snd_text_command_is_valid(snd_most_recent_text_command)) {
+        View_ID view = get_active_view(app, Access_ReadWriteVisible);
+        Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
-        Snd_Motion_Result mr = snd_execute_motion(app, buffer, view_get_cursor_pos(app, view), snd_most_recent_command.motion_count, snd_most_recent_command.motion);
-        if (snd_most_recent_command.action) {
-            snd_most_recent_command.action(app, mr);
-            // @TODO: Use buffer_history_get_record_info
-#if 0
-            if (snd_most_recent_command.action == snd_change_action) {
-                buffer_replace_range(app, buffer, Ii64(view_get_cursor_pos(app, view)), snd_inserted_text.string);
-                snd_enter_command_mode(app);
-            }
-#endif
-        } else {
-            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
+        if (!buffer_exists(app, buffer)) {
+            return;
+        }
+
+        snd_execute_text_command(app, view, buffer, snd_most_recent_text_command);
+
+        Record_Info record_info = buffer_history_get_record_info(app, buffer, snd_most_recent_text_command.history_record_index);
+        if (record_info.single_string_forward.size > 0) {
+            buffer_replace_range(app, buffer, Ii64(view_get_cursor_pos(app, view)), record_info.single_string_forward);
+            snd_enter_command_mode(app);
         }
     }
 }
@@ -1215,6 +1185,7 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_handle_chordal_input,                      KeyCode_W);
         Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Shift);
         Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Control);
+        Bind(snd_handle_chordal_input,                      KeyCode_E);
         Bind(snd_handle_chordal_input,                      KeyCode_B);
         Bind(snd_handle_chordal_input,                      KeyCode_B, KeyCode_Shift);
         Bind(snd_handle_chordal_input,                      KeyCode_D);
@@ -1236,7 +1207,6 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_new_line_above,                            KeyCode_O, KeyCode_Shift);
         Bind(interactive_open_or_new,                       KeyCode_O, KeyCode_Control);
         Bind(move_right,                                    KeyCode_L);
-        Bind(snd_move_right_token_end,                      KeyCode_E);
         Bind(page_up,                                       KeyCode_B, KeyCode_Control);
         Bind(page_down,                                     KeyCode_F, KeyCode_Control);
         Bind(snd_repeat_most_recent_command,                KeyCode_Period);
@@ -1283,9 +1253,10 @@ void custom_layer_init(Application_Links *app) {
 
     set_custom_hook(app, HookID_RenderCaller, snd_render_caller);
     set_custom_hook(app, HookID_BeginBuffer, snd_begin_buffer);
-    set_custom_hook(app, HookID_ViewEventHandler, snd_view_input_handler);
+    // set_custom_hook(app, HookID_ViewEventHandler, snd_view_input_handler);
 
     mapping_init(tctx, &framework_mapping);
+    // setup_default_mapping(&framework_mapping, mapid_global, mapid_file, mapid_code);
     snd_setup_mapping(&framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_command_mode);
 }
 
