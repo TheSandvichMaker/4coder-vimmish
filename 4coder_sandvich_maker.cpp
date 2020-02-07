@@ -29,7 +29,9 @@ enum Snd_Text_Motion {
     SndTextMotion_Word,
     SndTextMotion_WordEnd,
     SndTextMotion_LineSide,
-    SndTextMotion_Scope,
+    SndTextMotion_ScopeVimStyle,
+    SndTextMotion_Scope4CoderStyle,
+    SndTextMotion_SurroundingScope,
 };
 
 enum Snd_Text_Action {
@@ -37,19 +39,6 @@ enum Snd_Text_Action {
 
     SndTextAction_Cut,
     SndTextAction_Change,
-};
-
-enum Snd_Window_Action {
-    SndWindowAction_None,
-
-    SndWindowAction_Cycle,
-    SndWindowAction_Left,
-    SndWindowAction_Right,
-    SndWindowAction_Up,
-    SndWindowAction_Down,
-    SndWindowAction_Swap,
-    SndWindowAction_VSplit,
-    SndWindowAction_HSplit,
 };
 
 struct Snd_Text_Command {
@@ -65,6 +54,19 @@ inline b32 snd_text_command_is_valid(Snd_Text_Command command) {
     b32 result = (command.motion != SndTextMotion_None && command.motion_count > 0);
     return result;
 }
+
+enum Snd_Window_Action {
+    SndWindowAction_None,
+
+    SndWindowAction_Cycle,
+    SndWindowAction_Left,
+    SndWindowAction_Right,
+    SndWindowAction_Up,
+    SndWindowAction_Down,
+    SndWindowAction_Swap,
+    SndWindowAction_VSplit,
+    SndWindowAction_HSplit,
+};
 
 Snd_Text_Command snd_most_recent_text_command;
 
@@ -700,10 +702,12 @@ internal i64 snd_boundary_word(Application_Links* app, Buffer_ID buffer, Side si
     return result;
 }
 
-internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos, Scan_Direction dir, Snd_Text_Action associated_action, i32 motion_count, Snd_Text_Motion motion) {
-    Snd_Motion_Result outer_result = { Ii64_neg_inf, start_pos };
+internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffer_ID buffer, i64 start_pos_init, Scan_Direction dir, Snd_Text_Action associated_action, i32 motion_count, Snd_Text_Motion motion) {
+    Snd_Motion_Result outer_result = { Ii64_neg_inf, start_pos_init };
 
     for (i32 motion_index = 0; motion_index < motion_count; motion_index++) {
+        i64 start_pos = outer_result.seek_pos;
+
         Snd_Motion_Result inner_result = snd_null_motion(start_pos);
 
         switch (motion) {
@@ -728,7 +732,7 @@ internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffe
                         }
                     }
 
-                    if (associated_action) {
+                    if (associated_action && motion_index + 1 >= motion_count) {
                         // @Note: To mimic vim behaviour, we'll have to slice off one character from the end when using word motion for text actions
                         end_pos--;
                     }
@@ -764,7 +768,7 @@ internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffe
                 inner_result.seek_pos = (dir == Scan_Forward) ? inner_result.range.max : inner_result.range.min;
             } break;
 
-            case SndTextMotion_Scope: {
+            case SndTextMotion_ScopeVimStyle: {
                 Token_Array token_array = get_token_array_from_buffer(app, buffer);
                 if (token_array.count > 0) {
                     Token_Base_Kind opening_token = TokenBaseKind_EOF;
@@ -831,6 +835,39 @@ internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffe
                     }
                 }
             } break;
+
+            case SndTextMotion_Scope4CoderStyle: {
+                Find_Nest_Flag flags = FindNest_Scope;
+                Range_i64 range = Ii64(start_pos);
+                if (dir == Scan_Forward) {
+                    if (find_nest_side(app, buffer, range.start + 1, flags, Scan_Forward, NestDelim_Open, &range) &&
+                        find_nest_side(app, buffer, range.end, flags|FindNest_Balanced|FindNest_EndOfToken, Scan_Forward, NestDelim_Close, &range.end)
+                    ) {
+                        inner_result.range = range;
+                        inner_result.seek_pos = range.min;
+                    }
+                } else {
+                    if (find_nest_side(app, buffer, start_pos - 1, flags, Scan_Backward, NestDelim_Open, &range) &&
+                        find_nest_side(app, buffer, range.end, flags|FindNest_Balanced|FindNest_EndOfToken, Scan_Forward, NestDelim_Close, &range.end)
+                    ) {
+                        inner_result.range = range;
+                        inner_result.seek_pos = range.min;
+                    }
+                }
+            } break;
+
+            case SndTextMotion_SurroundingScope: {
+                Range_i64 range = Ii64(start_pos);
+                if (find_surrounding_nest(app, buffer, range.min, FindNest_Scope, &range)) {
+                    for (;;) {
+                        if (!find_surrounding_nest(app, buffer, range.min, FindNest_Scope, &range)) {
+                            break;
+                        }
+                    }
+                }
+                inner_result.range = range;
+                inner_result.seek_pos = range.min;
+            } break;
         }
 
         outer_result = { range_union(outer_result.range, inner_result.range), inner_result.seek_pos };
@@ -879,6 +916,14 @@ inline void snd_execute_text_command(Application_Links* app, View_ID view, Buffe
     }
 }
 
+enum Snd_Command_Kind {
+    SndCommandKind_None,
+
+    SndCommandKind_Utiliy,
+    SndCommandKind_Window,
+    SndCommandKind_Text,
+};
+
 internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
@@ -887,7 +932,10 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
         return;
     }
 
-    b32 is_window_command = false;
+    Snd_Command_Kind command_kind = SndCommandKind_None;
+
+    Key_Code utility_kc = 0;
+
     Snd_Window_Action window_action = SndWindowAction_None;
 
     Snd_Text_Command text_command = {};
@@ -895,97 +943,163 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
 
     User_Input in = get_current_input(app);
 
+    b32 first_time_in_loop = true;
     for (;;) {
+        if (first_time_in_loop) {
+            first_time_in_loop = false;
+        } else {
+            in = get_next_input(app, (EventPropertyGroup_AnyKeyboardEvent & ~EventProperty_AnyKeyRelease), EventProperty_Escape|EventProperty_ViewActivation);
+        }
+
         if (in.abort) {
             break;
         }
 
-        Snd_Text_Action entered_action = SndTextAction_None;
-        if (match_key_code(&in, KeyCode_C)) {
-            entered_action = SndTextAction_Change;
-        } else if (match_key_code(&in, KeyCode_D)) {
-            entered_action = SndTextAction_Cut;
-        }
+        b32 ctrl_down  = has_modifier(&in, KeyCode_Control);
+        b32 shift_down = has_modifier(&in, KeyCode_Shift);
+        Key_Code kc = in.event.key.code;
 
-        if (entered_action) {
-            if (!text_command.action) {
-                text_command.action = entered_action;
+        if (in.event.kind == InputEventKind_KeyStroke) {
+            //
+            // Complete Actions
+            //
+            b32 hit_any = true;
+            if (kc == KeyCode_G && shift_down) {
+                // @Note: Inline command
+                goto_end_of_file(app);
             } else {
-                if (text_command.action == entered_action) {
-                    // @Incomplete: Do the right behaviour
-                    break;
-                } else {
-                    break;
-                }
+                hit_any = false;
+            } if (hit_any) break;
+
+            //
+            // Action Leaders
+            //
+            Snd_Text_Action entered_action = SndTextAction_None;
+            if (kc == KeyCode_C) {
+                entered_action = SndTextAction_Change;
+            } else if (kc == KeyCode_D) {
+                entered_action = SndTextAction_Cut;
             }
-        }
 
-        if (!entered_action) {
-            if (match_key_code(&in, KeyCode_W) && has_modifier(&in, KeyCode_Control)) {
-                if (is_window_command) {
-                    window_action = SndWindowAction_Cycle;
-                }
-                is_window_command = true;
-            } else if (match_key_code(&in, KeyCode_H)) {
-                window_action = SndWindowAction_Left;
-            } else if (match_key_code(&in, KeyCode_J)) {
-                window_action = SndWindowAction_Down;
-            } else if (match_key_code(&in, KeyCode_K)) {
-                window_action = SndWindowAction_Up;
-            } else if (match_key_code(&in, KeyCode_L)) {
-                window_action = SndWindowAction_Right;
-            } else if (match_key_code(&in, KeyCode_V)) {
-                window_action = SndWindowAction_VSplit;
-            } else if (match_key_code(&in, KeyCode_S)) {
-                window_action = SndWindowAction_HSplit;
-            } else if (match_key_code(&in, KeyCode_X)) {
-                window_action = SndWindowAction_Swap;
-            } else if (match_key_code(&in, KeyCode_W)) {
-                text_command.motion = SndTextMotion_Word;
-            } else if (match_key_code(&in, KeyCode_E)) {
-                text_command.motion = SndTextMotion_WordEnd;
-            } else if (match_key_code(&in, KeyCode_B)) {
-                text_command.motion = SndTextMotion_Word;
-                text_command.motion_direction = Scan_Backward;
-            } else if (match_key_code(&in, KeyCode_0)) {
-                text_command.motion = SndTextMotion_LineSide;
-                text_command.motion_direction = Scan_Backward;
-            } else if (match_key_code(&in, KeyCode_4) && has_modifier(&in, KeyCode_Shift)) {
-                text_command.motion = SndTextMotion_LineSide;
-            } else if (match_key_code(&in, KeyCode_5) && has_modifier(&in, KeyCode_Shift)) {
-                text_command.motion = SndTextMotion_Scope;
-            } else {
-                String_Const_u8 in_string = to_writable(&in);
-                if (in_string.size) {
-                    if (string_is_integer(in_string, 10)) {
-                        i32 count = cast(i32) string_to_integer(in_string, 10);
-                        if (text_command.motion_count < 0) {
-                            text_command.motion_count = count;
-                        } else {
-                            text_command.motion_count = 10*text_command.motion_count + count;
-                        }
+            if (entered_action) {
+                if (!text_command.action) {
+                    text_command.action = entered_action;
+                    command_kind = SndCommandKind_Text;
+                    continue;
+                } else {
+                    if (text_command.action == entered_action) {
+                        // @Incomplete: Do the right behaviour
+                        break;
                     } else {
-                        leave_current_input_unhandled(app);
                         break;
                     }
-                } else {
-                    leave_current_input_unhandled(app);
                 }
             }
 
-            if (text_command.motion || (is_window_command && window_action)) {
+            if (!command_kind) {
+                hit_any = true;
+                if (kc == KeyCode_G || kc == KeyCode_Z) {
+                    command_kind = SndCommandKind_Utiliy;
+                    utility_kc = kc;
+                } else if (kc == KeyCode_W && ctrl_down) {
+                    if (command_kind == SndCommandKind_Window) {
+                        window_action = SndWindowAction_Cycle;
+                    }
+                    command_kind = SndCommandKind_Window;
+                } else {
+                    hit_any = false;
+                } if (hit_any) continue;
+            }
+
+            //
+            // Action Tails
+            //
+            if (command_kind == SndCommandKind_Utiliy) {
+                if (utility_kc == KeyCode_Z) {
+                    if (kc == KeyCode_Z) {
+                        center_view(app);
+                        break;
+                    }
+                }
+
+                if (utility_kc == KeyCode_G) {
+                    if (kc == KeyCode_G) {
+                        goto_beginning_of_file(app);
+                        break;
+                    }
+                }
+            }
+
+            //
+            // Motion Count
+            //
+            if (kc >= KeyCode_0 && kc <= KeyCode_9) {
+                i32 count = cast(i32) (kc - KeyCode_0);
+                if (!text_command.motion_count) {
+                    if (kc != KeyCode_0) {
+                        text_command.motion_count = count;
+                        continue;
+                    }
+                } else {
+                    text_command.motion_count = 10*text_command.motion_count + count;
+                    continue;
+                }
+            }
+
+            //
+            // Action Tails / Motions
+            //
+            hit_any = true;
+            if (kc == KeyCode_W) {
+                text_command.motion = SndTextMotion_Word;
+            } else if (kc == KeyCode_H) {
+                window_action = SndWindowAction_Left;
+            } else if (kc == KeyCode_J) {
+                window_action = SndWindowAction_Down;
+            } else if (kc == KeyCode_K) {
+                window_action = SndWindowAction_Up;
+            } else if (kc == KeyCode_L) {
+                window_action = SndWindowAction_Right;
+            } else if (kc == KeyCode_V) {
+                window_action = SndWindowAction_VSplit;
+            } else if (kc == KeyCode_S) {
+                window_action = SndWindowAction_HSplit;
+            } else if (kc == KeyCode_X) {
+                window_action = SndWindowAction_Swap;
+            } else if (kc == KeyCode_E) {
+                text_command.motion = SndTextMotion_WordEnd;
+            } else if (kc == KeyCode_B) {
+                text_command.motion = SndTextMotion_Word;
+                text_command.motion_direction = Scan_Backward;
+            } else if (kc == KeyCode_0) {
+                text_command.motion = SndTextMotion_LineSide;
+                text_command.motion_direction = Scan_Backward;
+            } else if (kc == KeyCode_4 && shift_down) {
+                text_command.motion = SndTextMotion_LineSide;
+            } else if (kc == KeyCode_5 && shift_down) {
+                text_command.motion = SndTextMotion_ScopeVimStyle;
+            } else if (kc == KeyCode_LeftBracket && ctrl_down && shift_down) {
+                text_command.motion = SndTextMotion_SurroundingScope;
+            } else if (kc == KeyCode_LeftBracket && shift_down) {
+                text_command.motion = SndTextMotion_Scope4CoderStyle;
+                text_command.motion_direction = Scan_Backward;
+            } else if (kc == KeyCode_RightBracket && shift_down) {
+                text_command.motion = SndTextMotion_Scope4CoderStyle;
+            } else {
+                hit_any = false;
+            }
+
+            if (hit_any) {
                 break;
             }
         }
-
-        in = get_next_input(app, EventPropertyGroup_AnyKeyboardEvent, EventProperty_Escape|EventProperty_ViewActivation);
     }
 
     if (!text_command.motion_count) {
         text_command.motion_count = 1;
     }
 
-    if (is_window_command) {
+    if (command_kind == SndCommandKind_Window) {
         Panel_ID panel = view_get_panel(app, view);
         switch (window_action) {
             case SndWindowAction_Cycle: { change_active_panel(app); } break;
@@ -1193,6 +1307,12 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_handle_chordal_input,                      KeyCode_0);
         Bind(snd_handle_chordal_input,                      KeyCode_4, KeyCode_Shift);
         Bind(snd_handle_chordal_input,                      KeyCode_5, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_LeftBracket, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_LeftBracket, KeyCode_Control, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_RightBracket, KeyCode_Shift);
+        Bind(snd_handle_chordal_input,                      KeyCode_Z);
+        Bind(snd_handle_chordal_input,                      KeyCode_G);
+        Bind(snd_handle_chordal_input,                      KeyCode_G, KeyCode_Shift);
 
         Bind(move_up,                                       KeyCode_K);
         Bind(move_up_to_blank_line_end,                     KeyCode_K, KeyCode_Control);
@@ -1217,7 +1337,6 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_change,                                    KeyCode_C, KeyCode_Shift);
         Bind(copy,                                          KeyCode_Y);
         Bind(paste_and_indent,                              KeyCode_P);
-        Bind(goto_line,                                     KeyCode_G);
         Bind(goto_next_jump,                                KeyCode_N, KeyCode_Control);
         Bind(goto_prev_jump,                                KeyCode_P, KeyCode_Control);
         Bind(search,                                        KeyCode_ForwardSlash);
