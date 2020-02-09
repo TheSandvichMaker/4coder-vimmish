@@ -6,12 +6,20 @@
 #include "4coder_default_include.cpp"
 
 CUSTOM_ID(command_map, snd_mapid_shared);
-CUSTOM_ID(command_map, snd_mapid_command_mode);
+CUSTOM_ID(command_map, snd_mapid_normal_mode);
 CUSTOM_ID(attachment, snd_buffer_attachment);
 
 #include "generated/managed_id_metadata.cpp"
 
 #define cast(...) (__VA_ARGS__)
+
+enum Snd_Mode {
+    SndMode_Normal,
+    SndMode_Insert,
+    SndMode_Append,
+    // SndMode_Visual,
+    // SndMode_VisualBlock,
+};
 
 struct Snd_Motion_Result {
     Range_i64 range;
@@ -41,20 +49,6 @@ enum Snd_Text_Action {
     SndTextAction_Change,
 };
 
-struct Snd_Text_Command {
-    History_Record_Index history_record_index;
-
-    Snd_Text_Action action;
-    Snd_Text_Motion motion;
-    Scan_Direction motion_direction;
-    i32 motion_count;
-};
-
-inline b32 snd_text_command_is_valid(Snd_Text_Command command) {
-    b32 result = (command.motion != SndTextMotion_None && command.motion_count > 0);
-    return result;
-}
-
 enum Snd_Window_Action {
     SndWindowAction_None,
 
@@ -68,24 +62,17 @@ enum Snd_Window_Action {
     SndWindowAction_HSplit,
 };
 
-Snd_Text_Command snd_most_recent_text_command;
+global struct {
+    b32 is_open;
+    Range_i64 macro_range;
+    History_Group history;
+} snd_most_recent_command;
 
 enum Snd_Buffer_Flag {
     SndBufferFlag_TreatAsCode = 0x1,
     SndBufferFlag_Append = 0x2,
     SndBufferFlag_BegunHistoryGroup = 0x4,
 };
-
-#if 0
-struct SndCommandNode {
-    SndCommandNode* next;
-    Custom_Command_Function* f;
-};
-
-global b32 snd_recording_input;
-global SndCommandNode* snd_first_command_node;
-global SndCommandNode* snd_first_free_command_node;
-#endif
 
 struct Snd_Buffer_Attachment {
     u32 flags;
@@ -193,7 +180,7 @@ function void snd_render_buffer(Application_Links *app, View_ID view_id, Face_ID
     // NOTE(snd): But do it my way!!!
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Command_Map_ID* map_id_ptr = scope_attachment(app, scope, buffer_map_id, Command_Map_ID);
-    b32 in_command_mode = (*map_id_ptr) == cast(i64) snd_mapid_command_mode; // @TODO: Weird!!! Why is Command_Map_ID i64 but Managed_ID u64?
+    b32 in_command_mode = (*map_id_ptr) == cast(i64) snd_mapid_normal_mode; // @TODO: Weird!!! Why is Command_Map_ID i64 but Managed_ID u64?
 
     snd_draw_cursor(app, view_id, is_active_view, buffer, text_layout_id, cursor_roundness, mark_thickness, in_command_mode);
 
@@ -313,7 +300,7 @@ BUFFER_HOOK_SIG(snd_begin_buffer) {
         }
     }
 
-    Command_Map_ID map_id = snd_mapid_command_mode;
+    Command_Map_ID map_id = snd_mapid_normal_mode;
 
     Managed_Scope scope = buffer_get_managed_scope(app, buffer_id);
     Command_Map_ID *map_id_ptr = scope_attachment(app, scope, buffer_map_id, Command_Map_ID);
@@ -420,7 +407,7 @@ inline History_Group* snd_begin_history_group_for_buffer(Application_Links* app,
         snd_buffer->history = history;
         snd_buffer->flags |= SndBufferFlag_BegunHistoryGroup;
     } else {
-        print_message(app, string_u8_litexpr("Warning: Tried to open history group for buffer when there's already one open"));
+        print_message(app, string_u8_litexpr("Warning: Tried to open history group for buffer when there's already one open\n"));
     }
 
     return &snd_buffer->history;
@@ -437,8 +424,31 @@ inline void snd_end_history_group_for_buffer(Application_Links* app, Buffer_ID b
         history_group_end(snd_buffer->history);
         snd_buffer->flags &= ~SndBufferFlag_BegunHistoryGroup;
     } else {
-        print_message(app, string_u8_litexpr("Warning: Tried to end history group for buffer when there isn't one open"));
+        print_message(app, string_u8_litexpr("Warning: Tried to end history group for buffer when there isn't one open\n"));
     }
+}
+
+internal void snd_command_begin(Application_Links* app, Buffer_ID buffer) {
+    if (snd_most_recent_command.is_open || get_current_input_is_virtual(app)) {
+        return;
+    }
+
+    snd_most_recent_command.is_open = true;
+    snd_most_recent_command.history = history_group_begin(app, buffer);
+}
+
+internal void snd_command_end(Application_Links* app) {
+    if (!snd_most_recent_command.is_open || get_current_input_is_virtual(app)) {
+        return;
+    }
+
+    snd_most_recent_command.is_open = false;
+
+    Buffer_ID buffer = get_keyboard_log_buffer(app);
+    Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
+    snd_most_recent_command.macro_range.max = cursor.pos;
+
+    history_group_end(snd_most_recent_command.history);
 }
 
 CUSTOM_COMMAND_SIG(snd_enter_command_mode)
@@ -448,20 +458,22 @@ CUSTOM_COMMAND_SIG(snd_enter_command_mode)
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
 
     Command_Map_ID* map_id_ptr = scope_attachment(app, scope, buffer_map_id, Command_Map_ID);
-    *map_id_ptr = snd_mapid_command_mode;
+    *map_id_ptr = snd_mapid_normal_mode;
 
     Snd_Buffer_Attachment* snd_buffer = scope_attachment(app, scope, snd_buffer_attachment, Snd_Buffer_Attachment);
 
-    if (snd_buffer->flags & SndBufferFlag_Append) {
-        if (snd_buffer->cursor_pos_on_append == view_get_cursor_pos(app, view)) {
+    // if (snd_buffer->flags & SndBufferFlag_Append) {
+    //     if (snd_buffer->cursor_pos_on_append == view_get_cursor_pos(app, view)) {
             snd_move_left_on_line(app);
-        }
-        snd_buffer->flags &= ~SndBufferFlag_Append;
-    }
+        // }
+    //     snd_buffer->flags &= ~SndBufferFlag_Append;
+    // }
 
     if (snd_buffer->flags & SndBufferFlag_BegunHistoryGroup) {
         snd_end_history_group_for_buffer(app, buffer);
     }
+
+    snd_command_end(app);
 }
 
 CUSTOM_COMMAND_SIG(snd_exit_command_mode) {
@@ -711,11 +723,14 @@ internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffe
         Snd_Motion_Result inner_result = snd_null_motion(start_pos);
 
         switch (motion) {
+            // @TODO: Simplify this, figure out how it should _really_ work
             case SndTextMotion_Word: {
-                // @TODO: Simplify this, figure out how it should _really_ work
                 Scratch_Block scratch(app);
 
                 i64 end_pos = start_pos;
+
+                b32 final_motion = (motion_index + 1 >= motion_count);
+                b32 include_final_whitespace = !final_motion || (associated_action != SndTextAction_Change);
 
                 if (dir == Scan_Forward) {
                     if (line_is_valid_and_blank(app, buffer, get_line_number_from_pos(app, buffer, end_pos))) {
@@ -727,12 +742,12 @@ internal Snd_Motion_Result snd_execute_text_motion(Application_Links* app, Buffe
                         end_pos = scan(app, push_boundary_list(scratch, snd_boundary_word, boundary_line), buffer, Scan_Forward, end_pos);
 
                         u8 c_at_cursor = buffer_get_char(app, buffer, end_pos);
-                        if (!character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
+                        if (include_final_whitespace && !character_is_newline(c_at_cursor) && character_is_whitespace(c_at_cursor)) {
                             end_pos = scan(app, push_boundary_list(scratch, boundary_whitespace, boundary_line), buffer, Scan_Forward, end_pos);
                         }
                     }
 
-                    if (associated_action && motion_index + 1 >= motion_count) {
+                    if (final_motion && (associated_action != SndTextAction_None)) {
                         // @Note: To mimic vim behaviour, we'll have to slice off one character from the end when using word motion for text actions
                         end_pos--;
                     }
@@ -883,36 +898,17 @@ internal void snd_cut_range_inclusive(Application_Links* app, View_ID view, Buff
     cut(app);
 }
 
-internal void snd_execute_text_action(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Text_Action action, Snd_Motion_Result mr) {
+internal void snd_execute_text_action(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Text_Action action, Range_i64 range) {
     switch (action) {
         case SndTextAction_Cut: {
-            snd_cut_range_inclusive(app, view, buffer, mr.range);
-            snd_end_history_group_for_buffer(app, buffer);
+            snd_cut_range_inclusive(app, view, buffer, range);
+            snd_command_end(app);
         } break;
 
         case SndTextAction_Change: {
-            snd_cut_range_inclusive(app, view, buffer, mr.range);
+            snd_cut_range_inclusive(app, view, buffer, range);
             snd_exit_command_mode(app);
         } break;
-    }
-}
-
-inline void snd_execute_text_command(Application_Links* app, View_ID view, Buffer_ID buffer, Snd_Text_Command command) {
-    if (command.motion) {
-        Snd_Motion_Result mr = snd_execute_text_motion(app, buffer, view_get_cursor_pos(app, view), command.motion_direction, command.action, command.motion_count, command.motion);
-        u32 buffer_flags = buffer_get_access_flags(app, buffer);
-        if (command.action && (buffer_flags & Access_Write)) {
-            snd_most_recent_text_command = command;
-
-            History_Group* history = snd_begin_history_group_for_buffer(app, buffer);
-            if (!snd_most_recent_text_command.history_record_index) {
-                snd_most_recent_text_command.history_record_index = history->first;
-            }
-
-            snd_execute_text_action(app, view, buffer, command.action, mr);
-        } else {
-            view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
-        }
     }
 }
 
@@ -924,6 +920,67 @@ enum Snd_Command_Kind {
     SndCommandKind_Text,
 };
 
+internal Snd_Text_Motion snd_get_text_motion_from_input(User_Input in, Scan_Direction* out_dir) {
+    Snd_Text_Motion result = SndTextMotion_None;
+    Scan_Direction dir = Scan_Forward;
+
+    if (in.event.kind == InputEventKind_KeyStroke) {
+        Key_Code kc = in.event.key.code;
+        b32 ctrl = has_modifier(&in, KeyCode_Control);
+        b32 shift = has_modifier(&in, KeyCode_Shift);
+
+        switch (kc) {
+            case KeyCode_W: { result = SndTextMotion_Word; } break;
+            case KeyCode_E: { result = SndTextMotion_WordEnd; } break;
+            case KeyCode_B: {
+                result = SndTextMotion_Word;
+                dir = Scan_Backward;
+            } break;
+            case KeyCode_0: {
+                result = SndTextMotion_LineSide;
+                dir = Scan_Backward;
+            } break;
+            case KeyCode_4: {
+                if (shift) result = SndTextMotion_LineSide;
+            } break;
+            case KeyCode_5: {
+                if (shift) result = SndTextMotion_ScopeVimStyle;
+            } break;
+            case KeyCode_LeftBracket: {
+                if (ctrl && shift) {
+                    result = SndTextMotion_SurroundingScope;
+                } else if (shift) {
+                    result = SndTextMotion_Scope4CoderStyle;
+                    dir = Scan_Backward;
+                }
+            } break;
+            case KeyCode_RightBracket: {
+                if (shift) result = SndTextMotion_Scope4CoderStyle;
+            } break;
+        }
+    }
+
+    if (out_dir) *out_dir = dir;
+
+    return result;
+}
+
+internal CUSTOM_COMMAND_SIG(snd_do_text_motion) {
+    View_ID view = get_active_view(app, Access_ReadVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+    if (!buffer_exists(app, buffer)) {
+        return;
+    }
+
+    User_Input in = get_current_input(app);
+    Scan_Direction dir = Scan_Forward;
+    Snd_Text_Motion motion = snd_get_text_motion_from_input(in, &dir);
+
+    Snd_Motion_Result mr = snd_execute_text_motion(app, buffer, view_get_cursor_pos(app, view), dir, SndTextAction_None, 1, motion);
+    view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
+}
+
 internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
@@ -932,14 +989,24 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
         return;
     }
 
+    if (!snd_most_recent_command.is_open && !get_current_input_is_virtual(app)) {
+        Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
+        i64 end = buffer_get_size(app, keyboard_log_buffer);
+        Buffer_Cursor cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(end));
+        Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
+        snd_most_recent_command.macro_range.min = back_cursor.pos;
+    }
+
     Snd_Command_Kind command_kind = SndCommandKind_None;
 
     Key_Code utility_kc = 0;
 
     Snd_Window_Action window_action = SndWindowAction_None;
 
-    Snd_Text_Command text_command = {};
-    text_command.motion_direction = Scan_Forward;
+    Snd_Text_Action text_action = SndTextAction_None;
+    Snd_Text_Motion text_motion = SndTextMotion_None;
+    Scan_Direction  text_motion_direction = Scan_Forward;
+    i32             text_motion_count     = 0;
 
     User_Input in = get_current_input(app);
 
@@ -955,9 +1022,14 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             break;
         }
 
+        Key_Code kc = in.event.key.code;
         b32 ctrl_down  = has_modifier(&in, KeyCode_Control);
         b32 shift_down = has_modifier(&in, KeyCode_Shift);
-        Key_Code kc = in.event.key.code;
+        b32 has_modifiers = is_modified(&in.event);
+
+        if (kc == KeyCode_Control || kc == KeyCode_Shift) {
+            continue;
+        }
 
         if (in.event.kind == InputEventKind_KeyStroke) {
             //
@@ -982,12 +1054,12 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             }
 
             if (entered_action) {
-                if (!text_command.action) {
-                    text_command.action = entered_action;
+                if (!text_action) {
+                    text_action = entered_action;
                     command_kind = SndCommandKind_Text;
                     continue;
                 } else {
-                    if (text_command.action == entered_action) {
+                    if (text_action == entered_action) {
                         // @Incomplete: Do the right behaviour
                         break;
                     } else {
@@ -1033,15 +1105,15 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             //
             // Motion Count
             //
-            if (kc >= KeyCode_0 && kc <= KeyCode_9) {
+            if (!has_modifiers && (kc >= KeyCode_0 && kc <= KeyCode_9)) {
                 i32 count = cast(i32) (kc - KeyCode_0);
-                if (!text_command.motion_count) {
+                if (!text_motion_count) {
                     if (kc != KeyCode_0) {
-                        text_command.motion_count = count;
+                        text_motion_count = count;
                         continue;
                     }
                 } else {
-                    text_command.motion_count = 10*text_command.motion_count + count;
+                    text_motion_count = 10*text_motion_count + count;
                     continue;
                 }
             }
@@ -1049,54 +1121,15 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             //
             // Action Tails / Motions
             //
-            hit_any = true;
-            if (kc == KeyCode_W) {
-                text_command.motion = SndTextMotion_Word;
-            } else if (kc == KeyCode_H) {
-                window_action = SndWindowAction_Left;
-            } else if (kc == KeyCode_J) {
-                window_action = SndWindowAction_Down;
-            } else if (kc == KeyCode_K) {
-                window_action = SndWindowAction_Up;
-            } else if (kc == KeyCode_L) {
-                window_action = SndWindowAction_Right;
-            } else if (kc == KeyCode_V) {
-                window_action = SndWindowAction_VSplit;
-            } else if (kc == KeyCode_S) {
-                window_action = SndWindowAction_HSplit;
-            } else if (kc == KeyCode_X) {
-                window_action = SndWindowAction_Swap;
-            } else if (kc == KeyCode_E) {
-                text_command.motion = SndTextMotion_WordEnd;
-            } else if (kc == KeyCode_B) {
-                text_command.motion = SndTextMotion_Word;
-                text_command.motion_direction = Scan_Backward;
-            } else if (kc == KeyCode_0) {
-                text_command.motion = SndTextMotion_LineSide;
-                text_command.motion_direction = Scan_Backward;
-            } else if (kc == KeyCode_4 && shift_down) {
-                text_command.motion = SndTextMotion_LineSide;
-            } else if (kc == KeyCode_5 && shift_down) {
-                text_command.motion = SndTextMotion_ScopeVimStyle;
-            } else if (kc == KeyCode_LeftBracket && ctrl_down && shift_down) {
-                text_command.motion = SndTextMotion_SurroundingScope;
-            } else if (kc == KeyCode_LeftBracket && shift_down) {
-                text_command.motion = SndTextMotion_Scope4CoderStyle;
-                text_command.motion_direction = Scan_Backward;
-            } else if (kc == KeyCode_RightBracket && shift_down) {
-                text_command.motion = SndTextMotion_Scope4CoderStyle;
-            } else {
-                hit_any = false;
-            }
-
-            if (hit_any) {
+            text_motion = snd_get_text_motion_from_input(in, &text_motion_direction);
+            if (text_motion) {
                 break;
             }
         }
     }
 
-    if (!text_command.motion_count) {
-        text_command.motion_count = 1;
+    if (!text_motion_count) {
+        text_motion_count = 1;
     }
 
     if (command_kind == SndCommandKind_Window) {
@@ -1108,27 +1141,109 @@ internal CUSTOM_COMMAND_SIG(snd_handle_chordal_input) {
             case SndWindowAction_Swap: { swap_panels(app); } break;
         }
     } else {
-        snd_execute_text_command(app, view, buffer, text_command);
+        if (text_motion) {
+            Snd_Motion_Result mr = snd_execute_text_motion(app, buffer, view_get_cursor_pos(app, view), text_motion_direction, text_action, text_motion_count, text_motion);
+            u32 buffer_flags = buffer_get_access_flags(app, buffer);
+            if (text_action && (buffer_flags & Access_Write)) {
+                snd_command_begin(app, buffer);
+                snd_execute_text_action(app, view, buffer, text_action, mr.range);
+            } else {
+                view_set_cursor_and_preferred_x(app, view, seek_pos(mr.seek_pos));
+            }
+        }
     }
 }
 
 CUSTOM_COMMAND_SIG(snd_repeat_most_recent_command) {
-    if (snd_text_command_is_valid(snd_most_recent_text_command)) {
-        View_ID view = get_active_view(app, Access_ReadWriteVisible);
-        Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+    if (snd_most_recent_command.is_open || get_current_input_is_virtual(app)) {
+        return;
+    }
 
-        if (!buffer_exists(app, buffer)) {
-            return;
-        }
+    Buffer_ID buffer = get_keyboard_log_buffer(app);
+    Scratch_Block scratch(app, Scratch_Share);
+    String_Const_u8 macro = push_buffer_range(app, scratch, buffer, snd_most_recent_command.macro_range);
+    keyboard_macro_play(app, macro);
+}
 
-        snd_execute_text_command(app, view, buffer, snd_most_recent_text_command);
+internal void snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i64 col_range, Range_i64 line_range, String_Const_u8 align_target) {
+    if (col_range.min == 0 && col_range.max == 0) {
+        col_range = Ii64(min_i64, max_i64);
+    }
 
-        Record_Info record_info = buffer_history_get_record_info(app, buffer, snd_most_recent_text_command.history_record_index);
-        if (record_info.single_string_forward.size > 0) {
-            buffer_replace_range(app, buffer, Ii64(view_get_cursor_pos(app, view)), record_info.single_string_forward);
-            snd_enter_command_mode(app);
+    i64 line_range_size = range_size_inclusive(line_range);
+
+    Scratch_Block scratch(app);
+    Buffer_Cursor* align_cursors = push_array(scratch, Buffer_Cursor, line_range_size);
+    Buffer_Cursor furthest_align_cursor = { -1, -1, -1 };
+
+    b32 is_already_fully_aligned = true;
+
+    for (i64 line_index = 0; line_index < line_range_size; line_index++) {
+        i64 line_number = line_range.min + line_index;
+
+        Range_i64 col_pos_range = Ii64(buffer_compute_cursor(app, buffer, seek_line_col(line_number, col_range.min)).pos,
+                                       buffer_compute_cursor(app, buffer, seek_line_col(line_number, col_range.max)).pos);
+        Range_i64 seek_range = range_intersect(get_line_pos_range(app, buffer, line_number), col_pos_range);
+
+        i64 align_pos = -1;
+        seek_string_forward(app, buffer, seek_range.min, seek_range.max, align_target, &align_pos);
+
+        if (align_pos >= 0) {
+            Buffer_Cursor align_cursor = buffer_compute_cursor(app, buffer, seek_pos(align_pos));
+            align_cursors[line_index] = align_cursor;
+
+            if (furthest_align_cursor.col >= 0) {
+                if (align_cursor.col != furthest_align_cursor.col) {
+                    is_already_fully_aligned = false;
+                }
+            }
+
+            if (align_cursor.col > furthest_align_cursor.col) {
+                furthest_align_cursor = align_cursor;
+            }
+        } else {
+            align_cursors[line_index] = { -1, -1, -1 };
         }
     }
+
+    if (is_already_fully_aligned) {
+        if (furthest_align_cursor.col >= 0) {
+            snd_align_range(app, buffer, Ii64(furthest_align_cursor.col + 1, col_range.max), line_range, align_target);
+        }
+    } else {
+        if (furthest_align_cursor.col >= 0) {
+            History_Group history = history_group_begin(app, buffer);
+            for (i64 line_index = 0; line_index < line_range_size; line_index++) {
+                Buffer_Cursor align_cursor = align_cursors[line_index];
+
+                // @Note: We have to recompute the cursor because by inserting indentation we adjust the absolute pos of the alignment point
+                align_cursor = buffer_compute_cursor(app, buffer, seek_line_col(align_cursor.line, align_cursor.col));
+
+                if (align_cursor.col >= 0) {
+                    i64 col_delta = furthest_align_cursor.col - align_cursor.col;
+                    if (col_delta > 0) {
+                        String_Const_u8 align_string = push_u8_stringf(scratch, "%*s", col_delta, "");
+                        buffer_replace_range(app, buffer, Ii64(align_cursor.pos), align_string);
+                    }
+                }
+            }
+            history_group_end(history);
+        }
+    }
+}
+
+CUSTOM_COMMAND_SIG(snd_align_equals)
+CUSTOM_DOC("...")
+{
+    View_ID view = get_active_view(app, Access_ReadVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+    i64 cursor_pos = view_get_cursor_pos(app, view);
+    i64 mark_pos   = view_get_mark_pos(app, view);
+
+    Range_i64 line_range = Ii64(get_line_number_from_pos(app, buffer, cursor_pos), get_line_number_from_pos(app, buffer, mark_pos));
+
+    snd_align_range(app, buffer, Ii64(cast(i64) 0), line_range, string_u8_litexpr("="));
 }
 
 function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, i64 file_id, i64 code_id, i64 command_id) {
@@ -1187,6 +1302,10 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
     SelectMap(shared_id);
     {
         ParentMap(global_id);
+        BindMouse(click_set_cursor_and_mark, MouseCode_Left);
+        BindMouseRelease(click_set_cursor, MouseCode_Left);
+        BindCore(click_set_cursor_and_mark, CoreCode_ClickActivateView);
+        BindMouseMove(click_set_cursor_if_lbutton);
         Bind(center_view,                                   KeyCode_E, KeyCode_Control);
         Bind(left_adjust_view,                              KeyCode_E, KeyCode_Control, KeyCode_Shift);
         Bind(search,                                        KeyCode_F, KeyCode_Control);
@@ -1214,10 +1333,6 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
     {
         ParentMap(shared_id);
         BindTextInput(write_text_input);
-        BindMouse(click_set_cursor_and_mark, MouseCode_Left);
-        BindMouseRelease(click_set_cursor, MouseCode_Left);
-        BindCore(click_set_cursor_and_mark, CoreCode_ClickActivateView);
-        BindMouseMove(click_set_cursor_if_lbutton);
         Bind(delete_char,                                 KeyCode_Delete);
         Bind(backspace_char,                              KeyCode_Backspace);
         Bind(move_up,                                     KeyCode_Up);
@@ -1295,24 +1410,24 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
     SelectMap(command_id);
     {
         ParentMap(shared_id);
-        // @Note(snd): These are handled specially
-        Bind(snd_handle_chordal_input,                      KeyCode_W);
-        Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_W);
+        Bind(snd_do_text_motion,                            KeyCode_W, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_E);
+        Bind(snd_do_text_motion,                            KeyCode_B);
+        Bind(snd_do_text_motion,                            KeyCode_B, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_0);
+        Bind(snd_do_text_motion,                            KeyCode_4, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_5, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_G, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_LeftBracket, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_LeftBracket, KeyCode_Control, KeyCode_Shift);
+        Bind(snd_do_text_motion,                            KeyCode_RightBracket, KeyCode_Shift);
+
         Bind(snd_handle_chordal_input,                      KeyCode_W, KeyCode_Control);
-        Bind(snd_handle_chordal_input,                      KeyCode_E);
-        Bind(snd_handle_chordal_input,                      KeyCode_B);
-        Bind(snd_handle_chordal_input,                      KeyCode_B, KeyCode_Shift);
         Bind(snd_handle_chordal_input,                      KeyCode_D);
         Bind(snd_handle_chordal_input,                      KeyCode_C);
-        Bind(snd_handle_chordal_input,                      KeyCode_0);
-        Bind(snd_handle_chordal_input,                      KeyCode_4, KeyCode_Shift);
-        Bind(snd_handle_chordal_input,                      KeyCode_5, KeyCode_Shift);
-        Bind(snd_handle_chordal_input,                      KeyCode_LeftBracket, KeyCode_Shift);
-        Bind(snd_handle_chordal_input,                      KeyCode_LeftBracket, KeyCode_Control, KeyCode_Shift);
-        Bind(snd_handle_chordal_input,                      KeyCode_RightBracket, KeyCode_Shift);
         Bind(snd_handle_chordal_input,                      KeyCode_Z);
         Bind(snd_handle_chordal_input,                      KeyCode_G);
-        Bind(snd_handle_chordal_input,                      KeyCode_G, KeyCode_Shift);
 
         Bind(move_up,                                       KeyCode_K);
         Bind(move_up_to_blank_line_end,                     KeyCode_K, KeyCode_Control);
@@ -1376,7 +1491,7 @@ void custom_layer_init(Application_Links *app) {
 
     mapping_init(tctx, &framework_mapping);
     // setup_default_mapping(&framework_mapping, mapid_global, mapid_file, mapid_code);
-    snd_setup_mapping(&framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_command_mode);
+    snd_setup_mapping(&framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_normal_mode);
 }
 
 #endif //FCODER_DEFAULT_BINDINGS
