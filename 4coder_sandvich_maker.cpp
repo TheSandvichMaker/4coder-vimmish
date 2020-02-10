@@ -31,6 +31,17 @@ inline Snd_Motion_Result snd_null_motion(i64 pos) {
     return result;
 }
 
+#define VIM_MOTION(name) Snd_Motion_Result name(Application_Links* app, Buffer_ID, i64 start_pos)
+typedef VIM_MOTION(Vim_Motion);
+
+#define VIM_ACTION(name) void name(Application_Links* app)
+typedef VIM_ACTION(Vim_Action);
+
+internal VIM_MOTION(vim_motion_word) {
+    /* ... */
+    return snd_null_motion(0);
+}
+
 enum Snd_Text_Motion {
     SndTextMotion_None,
 
@@ -1165,9 +1176,9 @@ CUSTOM_COMMAND_SIG(snd_repeat_most_recent_command) {
     keyboard_macro_play(app, macro);
 }
 
-internal void snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i64 col_range, Range_i64 line_range, String_Const_u8 align_target) {
+internal b32 snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i64 col_range, Range_i64 line_range, String_Const_u8 align_target, b32 align_after_target) {
     if (col_range.min == 0 && col_range.max == 0) {
-        col_range = Ii64(min_i64, max_i64);
+        col_range = Ii64(0, max_i64);
     }
 
     i64 line_range_size = range_size_inclusive(line_range);
@@ -1176,7 +1187,8 @@ internal void snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i6
     Buffer_Cursor* align_cursors = push_array(scratch, Buffer_Cursor, line_range_size);
     Buffer_Cursor furthest_align_cursor = { -1, -1, -1 };
 
-    b32 is_already_fully_aligned = true;
+    b32 found_align_target = false;
+    b32 did_align = false;
 
     for (i64 line_index = 0; line_index < line_range_size; line_index++) {
         i64 line_number = line_range.min + line_index;
@@ -1186,15 +1198,34 @@ internal void snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i6
         Range_i64 seek_range = range_intersect(get_line_pos_range(app, buffer, line_number), col_pos_range);
 
         i64 align_pos = -1;
-        seek_string_forward(app, buffer, seek_range.min, seek_range.max, align_target, &align_pos);
 
-        if (align_pos >= 0) {
+        String_Match match = buffer_seek_string(app, buffer, align_target, Scan_Forward, seek_range.min);
+        if (match.buffer == buffer && HasFlag(match.flags, StringMatch_CaseSensitive)) {
+            if (align_after_target) {
+                // @Note: Offset the seek position to skip over the range of the matched string, just in case for some reason
+                // the user asked to align a string with spaces in it, I guess.
+                i64 range_delta = range_size(match.range);
+                match.range.min += range_delta;
+                match.range.max += range_delta;
+                match = buffer_seek_character_class(app, buffer, &character_predicate_non_whitespace, Scan_Forward, match.range.first);
+            }
+
+            if (match.range.first < seek_range.max) {
+                align_pos = match.range.first;
+            }
+        }
+
+        if (align_pos != -1) {
+
             Buffer_Cursor align_cursor = buffer_compute_cursor(app, buffer, seek_pos(align_pos));
             align_cursors[line_index] = align_cursor;
 
-            if (furthest_align_cursor.col >= 0) {
+            found_align_target = true;
+
+            if (furthest_align_cursor.col != -1) {
                 if (align_cursor.col != furthest_align_cursor.col) {
-                    is_already_fully_aligned = false;
+                    // @Note: Well, we didn't align yet. But we will.
+                    did_align = true;
                 }
             }
 
@@ -1206,33 +1237,31 @@ internal void snd_align_range(Application_Links* app, Buffer_ID buffer, Range_i6
         }
     }
 
-    if (is_already_fully_aligned) {
-        if (furthest_align_cursor.col >= 0) {
-            snd_align_range(app, buffer, Ii64(furthest_align_cursor.col + 1, col_range.max), line_range, align_target);
-        }
-    } else {
-        if (furthest_align_cursor.col >= 0) {
-            History_Group history = history_group_begin(app, buffer);
-            for (i64 line_index = 0; line_index < line_range_size; line_index++) {
-                Buffer_Cursor align_cursor = align_cursors[line_index];
+    if (did_align) {
+        History_Group history = history_group_begin(app, buffer);
+        for (i64 line_index = 0; line_index < line_range_size; line_index++) {
+            Buffer_Cursor align_cursor = align_cursors[line_index];
 
+            if (align_cursor.col != -1) {
                 // @Note: We have to recompute the cursor because by inserting indentation we adjust the absolute pos of the alignment point
                 align_cursor = buffer_compute_cursor(app, buffer, seek_line_col(align_cursor.line, align_cursor.col));
 
-                if (align_cursor.col >= 0) {
-                    i64 col_delta = furthest_align_cursor.col - align_cursor.col;
-                    if (col_delta > 0) {
-                        String_Const_u8 align_string = push_u8_stringf(scratch, "%*s", col_delta, "");
-                        buffer_replace_range(app, buffer, Ii64(align_cursor.pos), align_string);
-                    }
+                i64 col_delta = furthest_align_cursor.col - align_cursor.col;
+                if (col_delta > 0) {
+                    String_Const_u8 align_string = push_u8_stringf(scratch, "%*s", col_delta, "");
+                    buffer_replace_range(app, buffer, Ii64(align_cursor.pos), align_string);
                 }
             }
-            history_group_end(history);
         }
+        history_group_end(history);
+    } else if (found_align_target) {
+        did_align |= snd_align_range(app, buffer, Ii64(furthest_align_cursor.col + 1, col_range.max), line_range, align_target, align_after_target);
     }
+
+    return did_align;
 }
 
-CUSTOM_COMMAND_SIG(snd_align_equals)
+CUSTOM_COMMAND_SIG(vim_align)
 CUSTOM_DOC("...")
 {
     View_ID view = get_active_view(app, Access_ReadVisible);
@@ -1243,10 +1272,382 @@ CUSTOM_DOC("...")
 
     Range_i64 line_range = Ii64(get_line_number_from_pos(app, buffer, cursor_pos), get_line_number_from_pos(app, buffer, mark_pos));
 
-    snd_align_range(app, buffer, Ii64(cast(i64) 0), line_range, string_u8_litexpr("="));
+    snd_align_range(app, buffer, Ii64(cast(i64) 0), line_range, string_u8_litexpr("="), false);
 }
 
-function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, i64 file_id, i64 code_id, i64 command_id) {
+CUSTOM_COMMAND_SIG(vim_align_right)
+CUSTOM_DOC("...")
+{
+    View_ID view = get_active_view(app, Access_ReadVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+    i64 cursor_pos = view_get_cursor_pos(app, view);
+    i64 mark_pos   = view_get_mark_pos(app, view);
+
+    Range_i64 line_range = Ii64(get_line_number_from_pos(app, buffer, cursor_pos), get_line_number_from_pos(app, buffer, mark_pos));
+
+    snd_align_range(app, buffer, Ii64(cast(i64) 0), line_range, string_u8_litexpr("="), true);
+}
+
+enum Vim_Modifier {
+    VimModifier_Control = 0x1,
+    VimModifier_Alt     = 0x2,
+    VimModifier_Shift   = 0x4,
+};
+
+struct Vim_Key {
+    u32 kc;
+    u32 mods;
+};
+
+inline u32 key_code_to_vim_modifier(Key_Code mod) {
+    switch (mod) {
+        case KeyCode_Control: return VimModifier_Control;
+        case KeyCode_Alt:     return VimModifier_Alt;
+        case KeyCode_Shift:   return VimModifier_Shift;
+    }
+    return 0;
+}
+
+inline Key_Code vim_modifier_to_key_code(u32 mod) {
+    switch (mod) {
+        case VimModifier_Control: return KeyCode_Control;
+        case VimModifier_Alt:     return KeyCode_Alt;
+        case VimModifier_Shift:   return KeyCode_Shift;
+    }
+    return 0;
+}
+
+inline Input_Modifier_Set_Fixed vim_modifiers_to_input_modifier_set_fixed(u32 mods) {
+    Input_Modifier_Set_Fixed result = {};
+    while (mods) {
+        Key_Code kc = vim_modifier_to_key_code(mods & 1);
+        if (kc) {
+            result.mods[result.count++] = kc;
+        }
+        mods = mods >> 1;
+    }
+    return result;
+}
+
+inline u32 input_modifier_set_to_vim_modifiers_internal(i32 count, Key_Code* mods) {
+    u32 result = 0;
+    for (i32 mod_index = 0; mod_index < count; mod_index++) {
+        u32 mod = key_code_to_vim_modifier(mods[mod_index]);
+        if (mod) {
+            result |= mod;
+        }
+    }
+    return result;
+}
+
+inline u32 input_modifier_set_to_vim_modifiers(Input_Modifier_Set mods) {
+    u32 result = input_modifier_set_to_vim_modifiers_internal(mods.count, mods.mods);
+    return result;
+}
+
+inline u32 input_modifier_set_fixed_to_vim_modifiers(Input_Modifier_Set_Fixed mods) {
+    u32 result = input_modifier_set_to_vim_modifiers_internal(mods.count, mods.mods);
+    return result;
+}
+
+internal Vim_Key vim_key_v(Key_Code kc, va_list args) {
+    Vim_Key result;
+    result.kc = kc;
+
+    Input_Modifier_Set_Fixed mods = {};
+    while (mods.count < Input_MaxModifierCount) {
+        i32 v = va_arg(args, i32);
+        if (v <= 0) {
+            break;
+        }
+        mods.mods[mods.count++] = v;
+    }
+
+    result.mods = input_modifier_set_fixed_to_vim_modifiers(mods);
+    return result;
+}
+
+#define vim_key(kc, ...) vim_key_(kc, __VA_ARGS__, 0)
+internal Vim_Key vim_key_(Key_Code kc, ...) {
+    va_list args;
+    va_start(args, kc);
+    Vim_Key result = vim_key_v(kc, args);
+    va_end(args);
+    return result;
+}
+
+inline Vim_Key get_vim_key_from_input(User_Input in) {
+    Vim_Key key = {};
+    key.kc = in.event.key.code;
+    key.mods = input_modifier_set_to_vim_modifiers(in.event.key.modifiers);
+    return key;
+}
+
+inline b32 vim_keys_match(Vim_Key a, Vim_Key b) {
+    b32 result = (a.kc == b.kc) && (a.mods == b.mods);
+    return result;
+}
+
+inline u64 vim_key_as_u64(Vim_Key key) {
+    u64 result = (cast(u64) key.kc) | ((cast(u64) key.mods) << 32);
+    return result;
+}
+
+enum Vim_Binding_Kind {
+    VimBindingKind_None,
+
+    VimBindingKind_Nested,
+    VimBindingKind_Motion,
+    VimBindingKind_Action,
+    VimBindingKind_4CoderCommand,
+};
+
+enum Vim_Binding_Flag {
+    VimBindingFlag_IsRepeatable = 0x1,
+};
+
+struct Vim_Key_Binding {
+    Vim_Binding_Kind kind;
+    u32 flags;
+    union {
+        Table_u64_u64* nested_keybind_table;
+        Vim_Motion* motion;
+        Vim_Action* action;
+        Custom_Command_Function* fcoder_command;
+    };
+};
+
+struct Vim_Binding_Handler {
+    // @TODO: This doesn't really need to be here, except for print_message.
+    Application_Links* app;
+
+    Mapping* mapping;
+    Command_Map* command_map;
+
+    Arena node_arena;
+    Heap heap;
+    Base_Allocator allocator;
+
+    Table_u64_u64 keybind_table;
+};
+
+global Vim_Binding_Handler vim_binds;
+
+CUSTOM_COMMAND_SIG(vim_handle_input);
+#define InitializeVimBindingHandler(handler, app) initialize_vim_binding_handler(handler, app, m, map)
+internal void initialize_vim_binding_handler(Vim_Binding_Handler* handler, Application_Links* app, Mapping* mapping, Command_Map* command_map) {
+    block_zero_struct(handler);
+
+    handler->app = app;
+    handler->mapping = mapping;
+    handler->command_map = command_map;
+    handler->node_arena = make_arena_system(KB(2));
+    heap_init(&handler->heap, &handler->node_arena);
+    handler->allocator = base_allocator_on_heap(&handler->heap);
+    handler->keybind_table = make_table_u64_u64(&handler->allocator, 32);
+
+    // @Note: These are for when you want to enter a count for an action
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_1, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_2, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_3, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_4, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_5, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_6, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_7, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_8, 0);
+    map_set_binding_l(mapping, command_map, vim_handle_input, InputEventKind_KeyStroke, KeyCode_9, 0);
+}
+
+internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Handler* handler, Table_u64_u64* table, Vim_Key key) {
+    Vim_Key_Binding* result = 0;
+
+    u64 location = 0;
+    if (table_read(table, vim_key_as_u64(key), &location)) {
+        result = cast(Vim_Key_Binding*) IntAsPtr(location);
+    } else {
+        result = push_array_zero(&handler->node_arena, Vim_Key_Binding, 1);
+        table_insert(table, vim_key_as_u64(key), PtrAsInt(result));
+    }
+
+    return result;
+}
+
+internal i32 input_to_digit(User_Input in) {
+    i32 result = -1;
+    Input_Event* event = &in.event;
+    // @TODO: This crashed here once, something about event->modifiers being all busted up. Why??
+    if (event->kind == InputEventKind_KeyStroke && is_unmodified_key(event)) {
+        if (event->key.code >= KeyCode_0 && event->key.code <= KeyCode_9) {
+            result = cast(i32) (event->key.code - KeyCode_0);
+        }
+    }
+    return result;
+}
+
+internal i64 vim_query_number(Application_Links* app, b32 handle_sign, User_Input* first_input = 0) {
+    User_Input in = first_input ? *first_input : get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation);
+
+    if (in.abort) {
+        return -1;
+    }
+
+    i64 sign = 1;
+    if (handle_sign && match_key_code(&in, KeyCode_Minus)) {
+        sign = -1;
+        in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation);
+    }
+
+    i64 result = 0;
+    for (;;) {
+        i32 digit = input_to_digit(in);
+
+        if (digit >= 0) {
+            // @TODO: Test these cases
+            if (result > (max_i64 / 10 - digit)) {
+                result = max_i64;
+                break;
+            } else if (result < (min_i64 / 10 + digit)) {
+                result = min_i64;
+                break;
+            } else {
+                result = 10*result + sign*digit;
+            }
+        } else {
+            break;
+        }
+
+        in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation);
+        if (in.abort) {
+            break;
+        }
+    }
+
+    return result;
+}
+
+CUSTOM_COMMAND_SIG(vim_handle_input) {
+    Buffer_ID buffer = view_get_buffer(app, get_active_view(app, Access_ReadVisible), Access_ReadVisible);
+
+    User_Input in = get_current_input(app);
+    Vim_Key key = get_vim_key_from_input(in);
+    Vim_Key_Binding* bind = make_or_retrieve_vim_binding(&vim_binds, &vim_binds.keybind_table, key);
+
+    if (bind->kind != VimBindingKind_None && !snd_most_recent_command.is_open && !get_current_input_is_virtual(app)) {
+        Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
+        i64 end = buffer_get_size(app, keyboard_log_buffer);
+        Buffer_Cursor cursor      = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(end));
+        Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
+        snd_most_recent_command.macro_range.min = back_cursor.pos;
+    }
+
+    i32 action_count = 1;
+    if (input_to_digit(in) > 0) {
+        i64 queried_number = vim_query_number(app, false, &in);
+        action_count = cast(i32) clamp(1, queried_number, 256);
+        Scratch_Block scratch(app);
+        String_Const_u8 string = push_u8_stringf(scratch, "Action count: %d\n", action_count);
+        print_message(app, string);
+    }
+
+    if (bind->kind == VimBindingKind_Nested) {
+        do {
+            in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation);
+            if (in.abort) return;
+        } while (key_code_to_vim_modifier(in.event.key.code));
+        key  = get_vim_key_from_input(in);
+        bind = make_or_retrieve_vim_binding(&vim_binds, bind->nested_keybind_table, key);
+    }
+
+    if (bind->flags & VimBindingFlag_IsRepeatable) {
+        snd_command_begin(app, buffer);
+    }
+
+    switch (bind->kind) {
+        case VimBindingKind_Motion: {
+            print_message(app, string_u8_litexpr("It is a   M O T I O N\n"));
+        } break;
+
+        case VimBindingKind_Action: {
+            print_message(app, string_u8_litexpr("It is an   A C T I O N\n"));
+
+            bind->action(app);
+        } break;
+
+        case VimBindingKind_4CoderCommand: {
+            print_message(app, string_u8_litexpr("It is a   4 C O D E R   C O M M A N D\n"));
+
+            bind->fcoder_command(app);
+        } break;
+    }
+
+    if (bind->flags & VimBindingFlag_IsRepeatable) {
+        // @TODO: Only do this if you're not in insert mode after executing the action
+        snd_command_end(app);
+    }
+}
+
+internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Handler* handler, Vim_Key key1, Vim_Key key2) {
+    Vim_Key_Binding* result = 0;
+
+    if (key1.kc) {
+        Command_Binding binding;
+        binding.custom = vim_handle_input;
+
+        Input_Modifier_Set_Fixed fixed_modifiers = vim_modifiers_to_input_modifier_set_fixed(key1.mods);
+        Input_Modifier_Set modifiers = { fixed_modifiers.mods, fixed_modifiers.count };
+        map_set_binding_key(handler->mapping, handler->command_map, binding, key1.kc, &modifiers);
+
+        Vim_Key_Binding* key1_binding = make_or_retrieve_vim_binding(handler, &handler->keybind_table, key1);
+
+        if (key2.kc) {
+            if (key1_binding->kind != VimBindingKind_Nested) {
+                if (key1_binding->kind != VimBindingKind_None) {
+                    Scratch_Block scratch(handler->app);
+                    String_Const_u8 string = push_u8_stringf(scratch, "Warning: Stomped on prior vim keybind of type %u with key code %u and modifiers 0x%x\n",
+                        key1_binding->kind, key1.kc, key1.mods);
+                    print_message(handler->app, string);
+                }
+
+                key1_binding->kind = VimBindingKind_Nested;
+
+                Table_u64_u64* inner_table = push_array(&handler->node_arena, Table_u64_u64, 1);
+                *inner_table = make_table_u64_u64(&handler->allocator, 8);
+
+                key1_binding->nested_keybind_table = inner_table;
+            }
+
+            result = make_or_retrieve_vim_binding(handler, key1_binding->nested_keybind_table, key2);
+        } else {
+            result = key1_binding;
+        }
+    }
+
+    return result;
+}
+
+internal void add_vim_motion(Vim_Binding_Handler* handler, Vim_Motion* motion, Vim_Key key1, Vim_Key key2 = {}, u32 flags = 0) {
+    Vim_Key_Binding* bind = add_vim_binding(handler, key1, key2);
+    bind->kind = VimBindingKind_Motion;
+    bind->flags |= flags;
+    bind->motion = motion;
+}
+
+internal void add_vim_action(Vim_Binding_Handler* handler, Vim_Action* action, Vim_Key key1, Vim_Key key2 = {}, u32 flags = 0) {
+    Vim_Key_Binding* bind = add_vim_binding(handler, key1, key2);
+    bind->kind = VimBindingKind_Action;
+    bind->flags |= flags|VimBindingFlag_IsRepeatable;
+    bind->action = action;
+}
+
+internal void add_vim_4coder_command(Vim_Binding_Handler* handler, Custom_Command_Function* fcoder_command, Vim_Key key1, Vim_Key key2 = {}, u32 flags = 0) {
+    Vim_Key_Binding* bind = add_vim_binding(handler, key1, key2);
+    bind->kind = VimBindingKind_4CoderCommand;
+    bind->flags |= flags;
+    bind->fcoder_command = fcoder_command;
+}
+
+function void snd_setup_mapping(Application_Links* app, Mapping *mapping, i64 global_id, i64 shared_id, i64 file_id, i64 code_id, i64 command_id) {
     MappingScope();
     SelectMapping(mapping);
 
@@ -1410,6 +1811,7 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
     SelectMap(command_id);
     {
         ParentMap(shared_id);
+#if 0
         Bind(snd_do_text_motion,                            KeyCode_W);
         Bind(snd_do_text_motion,                            KeyCode_W, KeyCode_Shift);
         Bind(snd_do_text_motion,                            KeyCode_E);
@@ -1428,6 +1830,7 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_handle_chordal_input,                      KeyCode_C);
         Bind(snd_handle_chordal_input,                      KeyCode_Z);
         Bind(snd_handle_chordal_input,                      KeyCode_G);
+#endif
 
         Bind(move_up,                                       KeyCode_K);
         Bind(move_up_to_blank_line_end,                     KeyCode_K, KeyCode_Control);
@@ -1462,10 +1865,31 @@ function void snd_setup_mapping(Mapping *mapping, i64 global_id, i64 shared_id, 
         Bind(snd_append,                                    KeyCode_A);
         Bind(snd_append_to_line_end,                        KeyCode_A, KeyCode_Shift);
 
+        InitializeVimBindingHandler(&vim_binds, app);
+        add_vim_motion(&vim_binds, vim_motion_word, vim_key(KeyCode_W));
+        add_vim_motion(&vim_binds, vim_motion_word, vim_key(KeyCode_G), vim_key(KeyCode_G));
+
+        add_vim_action(&vim_binds, vim_align,       vim_key(KeyCode_G), vim_key(KeyCode_L));
+        add_vim_action(&vim_binds, vim_align_right, vim_key(KeyCode_G), vim_key(KeyCode_L, KeyCode_Shift));
+
+        add_vim_4coder_command(&vim_binds, center_view, vim_key(KeyCode_Z), vim_key(KeyCode_Z));
 #if 0
-        Bind(keyboard_macro_start_recording ,   KeyCode_U, KeyCode_Control);
-        Bind(keyboard_macro_finish_recording,   KeyCode_U, KeyCode_Control, KeyCode_Shift);
-        Bind(keyboard_macro_replay,             KeyCode_U, KeyCode_Alt);
+        add_vim_motion(&vim_binds, vim_motion_left,              { KeyCode_H });
+        add_vim_motion(&vim_binds, vim_motion_down,              { KeyCode_J });
+        add_vim_motion(&vim_binds, vim_motion_up,                { KeyCode_K });
+        add_vim_motion(&vim_binds, vim_motion_down,              { KeyCode_L });
+        add_vim_motion(&vim_binds, vim_motion_word_end,          { KeyCode_E });
+        add_vim_motion(&vim_binds, vim_motion_scope,             { KeyCode_6, VimModifier_Shift });
+        add_vim_motion(&vim_binds, vim_motion_buffer_end,        { KeyCode_G, VimModifier_Shift });
+        add_vim_motion(&vim_binds, vim_motion_buffer_start,      { KeyCode_G }, { KeyCode_G });
+
+        add_vim_action(&vim_binds, vim_align,       { KeyCode_L });
+        add_vim_action(&vim_binds, vim_align_right, { KeyCode_L, VimModifier_Shift });
+
+        add_vim_action(&vim_binds, vim_move_panel_left,  { KeyCode_W, KeyCode_Control }, { KeyCode_H });
+        add_vim_action(&vim_binds, vim_move_panel_down,  { KeyCode_W, KeyCode_Control }, { KeyCode_J });
+        add_vim_action(&vim_binds, vim_move_panel_up,    { KeyCode_W, KeyCode_Control }, { KeyCode_K });
+        add_vim_action(&vim_binds, vim_move_panel_right, { KeyCode_W, KeyCode_Control }, { KeyCode_L });
 #endif
     }
 }
@@ -1491,7 +1915,7 @@ void custom_layer_init(Application_Links *app) {
 
     mapping_init(tctx, &framework_mapping);
     // setup_default_mapping(&framework_mapping, mapid_global, mapid_file, mapid_code);
-    snd_setup_mapping(&framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_normal_mode);
+    snd_setup_mapping(app, &framework_mapping, mapid_global, snd_mapid_shared, mapid_file, mapid_code, snd_mapid_normal_mode);
 }
 
 #endif //FCODER_DEFAULT_BINDINGS
