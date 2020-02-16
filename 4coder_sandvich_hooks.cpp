@@ -391,7 +391,7 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
         animate_in_n_milliseconds(app, 0);
     }
 	
-#if 1
+#if 0
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
     if (buffer_exists(app, buffer)) {
