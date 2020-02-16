@@ -403,7 +403,7 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
             i64 line       = get_line_number_from_pos(app, buffer, cursor);
             i64 line_end   = get_line_end_pos(app, buffer, line);
             if (!line_is_blank(app, buffer, line) && cursor == line_end) {
-                view_set_cursor_by_character_delta(app, view, -1);
+                view_set_cursor_by_character_delta(app, view, 1);
             }
         }
     }
