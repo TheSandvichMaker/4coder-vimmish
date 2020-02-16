@@ -348,51 +348,24 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
 }
 
 function void vim_tick(Application_Links *app, Frame_Info frame_info) {
-    Scratch_Block scratch(app);
-	
-    for (Buffer_Modified_Node *node = global_buffer_modified_set.first;
-         node != 0;
-         node = node->next){
-        Temp_Memory_Block temp(scratch);
-        Buffer_ID buffer_id = node->buffer;
-		
-        Managed_Scope scope = buffer_get_managed_scope(app, buffer_id);
-		
-        String_Const_u8 contents = push_whole_buffer(app, scratch, buffer_id);
-        Token_Array *tokens_ptr = scope_attachment(app, scope, attachment_tokens, Token_Array);
-        if (tokens_ptr == 0){
-            continue;
+    default_tick(app, frame_info);
+
+    View_ID view = get_active_view(app, Access_Visible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_Visible);
+    if (buffer_exists(app, buffer)) {
+        Managed_Scope scope = view_get_managed_scope(app, view);
+        Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
+
+        if (vim_view->most_recent_known_buffer && vim_view->most_recent_known_buffer != buffer) {
+            vim_log_jump_history_manual(app, view, vim_view->most_recent_known_buffer, vim_view, vim_view->most_recent_known_pos);
+            vim_view->previous_buffer = vim_view->most_recent_known_buffer;
         }
-        if (tokens_ptr->count == 0){
-            continue;
-        }
-        Token_Array tokens = *tokens_ptr;
-		
-        Arena arena = make_arena_system(KB(16));
-        Code_Index_File *index = push_array_zero(&arena, Code_Index_File, 1);
-        index->buffer = buffer_id;
-		
-        Generic_Parse_State state = {};
-        generic_parse_init(app, &arena, contents, &tokens, &state);
-        // TODO(allen): Actually determine this in a fair way.
-        // Maybe switch to an enum.
-        state.do_cpp_parse = true;
-        generic_parse_full_input_breaks(index, &state, max_i32);
-		
-        code_index_lock();
-        code_index_set_file(buffer_id, arena, index);
-        code_index_unlock();
-        buffer_clear_layout_cache(app, buffer_id);
-    }
-	
-    buffer_modified_set_clear();
-	
-    if (tick_all_fade_ranges(frame_info.animation_dt)){
-        animate_in_n_milliseconds(app, 0);
+
+        vim_view->most_recent_known_buffer = buffer;
+        vim_view->most_recent_known_pos = view_get_cursor_pos(app, view);
     }
 	
 #if 0
-    View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
     if (buffer_exists(app, buffer)) {
         Managed_Scope scope = buffer_get_managed_scope(app, buffer);
