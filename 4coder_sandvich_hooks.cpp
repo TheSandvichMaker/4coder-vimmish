@@ -360,28 +360,16 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
             vim_view->most_recent_known_buffer != buffer &&
             vim_view->most_recent_known_buffer != scratch_buffer)
         {
-            vim_log_jump_history_internal(app, view, vim_view->most_recent_known_buffer, vim_view, vim_view->most_recent_known_pos);
+            if (vim_view->dont_log_this_buffer_jump) {
+                vim_view->dont_log_this_buffer_jump = false;
+            } else {
+                vim_log_jump_history_internal(app, view, vim_view->most_recent_known_buffer, vim_view, vim_view->most_recent_known_pos);
+            }
             vim_view->previous_buffer = vim_view->most_recent_known_buffer;
+            vim_view->pos_in_previous_buffer = vim_view->most_recent_known_pos;
         }
 		
         vim_view->most_recent_known_buffer = buffer;
         vim_view->most_recent_known_pos = view_get_cursor_pos(app, view);
     }
-	
-#if 0
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
-    if (buffer_exists(app, buffer)) {
-        Managed_Scope scope = buffer_get_managed_scope(app, buffer);
-        Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
-		
-        if (!(vim_buffer->flags & VimBufferFlag_AllowSittingOnLineEnd)) {
-            i64 cursor = view_get_cursor_pos(app, view);
-            i64 line       = get_line_number_from_pos(app, buffer, cursor);
-            i64 line_end   = get_line_end_pos(app, buffer, line);
-            if (!line_is_blank(app, buffer, line) && cursor == line_end) {
-                view_set_cursor_by_character_delta(app, view, 1);
-            }
-        }
-    }
-#endif
 }
