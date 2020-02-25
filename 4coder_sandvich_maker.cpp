@@ -67,17 +67,23 @@ inline b32 is_vim_visual_mode(Vim_Mode mode) {
     return result;
 }
 
-struct Vim_Global_State {
-    b32 started_command;
+struct Vim_Command_Macro_Recording {
+    b32 recording;
     i64 keyboard_buffer_cursor_on_most_recent_input;
-    Range_i64 recorded_command_macro_range;
-    History_Group command_history;
+    Range_i64 range;
+    History_Group history;
+};
+
+struct Vim_Global_State {
+    Vim_Command_Macro_Recording most_recent_command;
+    Vim_Command_Macro_Recording current_recording_command;
 
     Scan_Direction search_direction;
 	
     u8              most_recent_character_seek_storage[4];
     String_u8       most_recent_character_seek;
     Scan_Direction  most_recent_character_seek_dir;
+    b32             most_recent_character_seek_till;
     b32             most_recent_character_seek_inclusive;
 	
     u8 chord_bar_storage[32];
@@ -861,27 +867,31 @@ CUSTOM_COMMAND_SIG(snd_move_right_on_visual_line) {
 }
 
 internal void vim_command_begin(Application_Links* app, Buffer_ID buffer) {
-    if (vim_state.started_command) {
+    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
+
+    if (recording->recording) {
         return;
     }
 	
-    vim_state.started_command = true;
-    vim_state.command_history = history_group_begin(app, buffer);
+    recording->recording = true;
+    recording->history = history_group_begin(app, buffer);
 	
     if (get_current_input_is_virtual(app)) {
         return;
     }
 	
-    vim_state.recorded_command_macro_range.min = vim_state.keyboard_buffer_cursor_on_most_recent_input;
+    recording->range.min = recording->keyboard_buffer_cursor_on_most_recent_input;
 }
 
-internal void vim_command_end(Application_Links* app) {
-    if (!vim_state.started_command) {
+internal void vim_command_end(Application_Links* app, b32 completed) {
+    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
+
+    if (!recording->recording) {
         return;
     }
 	
-    vim_state.started_command = false;
-    history_group_end(vim_state.command_history);
+    recording->recording = false;
+    history_group_end(recording->history);
 	
     if (get_current_input_is_virtual(app)) {
         return;
@@ -889,7 +899,11 @@ internal void vim_command_end(Application_Links* app) {
 	
     Buffer_ID buffer = get_keyboard_log_buffer(app);
     Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
-    vim_state.recorded_command_macro_range.max = cursor.pos;
+    recording->range.max = cursor.pos;
+
+    if (completed) {
+        vim_state.most_recent_command = vim_state.current_recording_command;
+    }
 }
 
 internal void vim_enter_mode(Application_Links* app, Vim_Mode mode) {
@@ -916,7 +930,8 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode) {
             if (is_vim_insert_mode(vim_buffer->mode)) {
                 snd_move_left_on_visual_line(app);
             }
-            vim_command_end(app);
+            User_Input in = get_current_input(app);
+            vim_command_end(app, !match_key_code(&in, KeyCode_Escape));
             vim_state.most_recent_character_seek.size = 0;
         } break;
 		
@@ -1186,22 +1201,16 @@ internal void vim_cut_range(Application_Links* app, View_ID view, Buffer_ID buff
 }
 
 CUSTOM_COMMAND_SIG(vim_repeat_most_recent_command) {
-    if (vim_state.started_command || get_current_input_is_virtual(app)) {
-        return;
-    }
-	
-    Buffer_ID buffer = view_get_buffer(app, get_active_view(app, Access_ReadWriteVisible), Access_ReadWriteVisible);
-    if (!buffer_exists(app, buffer)) {
+    Vim_Command_Macro_Recording* recording = &vim_state.most_recent_command;
+
+    if (recording->recording || get_current_input_is_virtual(app)) {
         return;
     }
 	
     Buffer_ID keyboard_buffer = get_keyboard_log_buffer(app);
-    if (!buffer_exists(app, keyboard_buffer)) {
-        return;
-    }
 	
     Scratch_Block scratch(app, Scratch_Share);
-    String_Const_u8 macro = push_buffer_range(app, scratch, keyboard_buffer, vim_state.recorded_command_macro_range);
+    String_Const_u8 macro = push_buffer_range(app, scratch, keyboard_buffer, recording->range);
 	
     print_message(app, string_u8_litexpr("Replaying command:\n"));
     keyboard_macro_play(app, macro);
@@ -1235,11 +1244,12 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
         InvalidPath;
     }
 	
-    if (!vim_state.started_command && !get_current_input_is_virtual(app)) {
+    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
+    if (!recording->recording && !get_current_input_is_virtual(app)) {
         Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
         Buffer_Cursor cursor      = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
         Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
-        vim_state.keyboard_buffer_cursor_on_most_recent_input = back_cursor.pos;
+        recording->keyboard_buffer_cursor_on_most_recent_input = back_cursor.pos;
     }
 	
     User_Input in = get_current_input(app);
@@ -1300,27 +1310,7 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
             } break;
             
             case VimBindingKind_Operator: {
-                Vim_Visual_Selection selection = {};
-                i64 cursor_pos = view_get_cursor_pos(app, view);
-                i64 mark_pos = view_get_mark_pos(app, view);
-                if (vim_buffer->mode == VimMode_Visual || vim_buffer->mode == VimMode_VisualLine) {
-                    selection.kind = vim_buffer->mode == VimMode_VisualLine ? VimSelectionKind_Line : VimSelectionKind_Range;
-                    selection.range = Ii64(cursor_pos, mark_pos);
-                    // if (vim_buffer->mode == VimMode_VisualLine) {
-                    //     selection.range = maximize_visual_line_range(app, view, selection.range, false);
-                    // }
-                } else if (vim_buffer->mode == VimMode_VisualBlock) {
-                    selection.kind = VimSelectionKind_Block;
-                    i64 first_pos = mark_pos < cursor_pos ? mark_pos : cursor_pos;
-                    i64 last_pos  = mark_pos > cursor_pos ? mark_pos : cursor_pos;
-                    Buffer_Cursor first = buffer_compute_cursor(app, buffer, seek_pos(first_pos));
-                    Buffer_Cursor last  = buffer_compute_cursor(app, buffer, seek_pos(last_pos));
-                    selection.first_line = first.line;
-                    selection.first_col  = first.col;
-                    selection.one_past_last_line = last.line + 1;
-                    selection.one_past_last_col  = last.col + 1;
-                }
-                
+                Vim_Visual_Selection selection = vim_get_selection(app, view, buffer, false);
                 bind->op(app, handler, view, buffer, selection, count);
             } break;
             
@@ -1344,7 +1334,7 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
         
         if (bind->flags & VimBindingFlag_IsRepeatable) {
             if (vim_buffer->mode == VimMode_Normal) {
-                vim_command_end(app);
+                vim_command_end(app, true);
             }
         }
     }
@@ -1870,7 +1860,7 @@ internal VIM_MOTION(vim_motion_inner_word) {
     return result;
 }
 
-internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, String_Const_u8 target, Scan_Direction dir, b32 inclusive) {
+internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, String_Const_u8 target, Scan_Direction dir, b32 till, b32 inclusive) {
     Vim_Motion_Result result = vim_null_motion(start_pos);
     result.inclusive = cast(b8) inclusive;
     result.set_preferred_x = true;
@@ -1885,16 +1875,16 @@ internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links*
     if (target.size) {
         i64 seek_pos = start_pos;
         for (;;) {
-            String_Match match = buffer_seek_string(app, buffer, target, dir, seek_pos + (inclusive ? 0 : dir));
+            String_Match match = buffer_seek_string(app, buffer, target, dir, seek_pos + (till ? 0 : dir));
             if (match.buffer != buffer) {
                 break;
             }
             if (HasFlag(match.flags, StringMatch_CaseSensitive)) {
                 result.range = Ii64(start_pos, match.range.min);
                 if (dir == Scan_Forward) {
-                    result.seek_pos = result.range.max - (inclusive ? 0 : 1);
+                    result.seek_pos = result.range.max - (till ? 0 : 1);
                 } else {
-                    result.seek_pos = result.range.min + (inclusive ? 0 : target.size);
+                    result.seek_pos = result.range.min + (till ? 0 : target.size);
                 }
                 break;
             }
@@ -1910,6 +1900,7 @@ internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links*
             vim_state.most_recent_character_seek.size = target.size;
 			
             vim_state.most_recent_character_seek_dir = dir;
+            vim_state.most_recent_character_seek_till = till;
             vim_state.most_recent_character_seek_inclusive = inclusive;
         }
     }
@@ -1919,32 +1910,32 @@ internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links*
 
 internal VIM_MOTION(vim_motion_find_character) {
     String_Const_u8 target = vim_get_next_writable(app);
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Forward, true);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Forward, true, true);
 }
 
 internal VIM_MOTION(vim_motion_to_character) {
     String_Const_u8 target = vim_get_next_writable(app);
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Forward, false);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Forward, false, false);
 }
 
 internal VIM_MOTION(vim_motion_find_character_backward) {
     String_Const_u8 target = vim_get_next_writable(app);
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Backward, true);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Backward, true, false);
 }
 
 internal VIM_MOTION(vim_motion_to_character_backward) {
     String_Const_u8 target = vim_get_next_writable(app);
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Backward, false);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, target, Scan_Backward, false, false);
 }
 
 internal VIM_MOTION(vim_motion_repeat_character_seek_forward) {
     Scan_Direction dir = vim_state.most_recent_character_seek_dir;
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_inclusive);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_inclusive, vim_state.most_recent_character_seek_till);
 }
 
 internal VIM_MOTION(vim_motion_repeat_character_seek_backward) {
     Scan_Direction dir = -vim_state.most_recent_character_seek_dir;
-    return vim_motion_seek_character_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_inclusive);
+    return vim_motion_seek_character_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_inclusive, vim_state.most_recent_character_seek_till);
 }
 
 internal i64 vim_seek_blank_line(Application_Links *app, Scan_Direction direction, Position_Within_Line position) {
@@ -2017,7 +2008,8 @@ inline Vim_Motion* vim_unwrap_motion_query(Vim_Key_Binding* query, Vim_Operator*
 }
 
 enum Vim_Operator_State_Flag {
-    VimOpFlag_QueryMotion = 0x1,
+    VimOpFlag_QueryMotion     = 0x1,
+    VimOpFlag_ChangeBehaviour = 0x2,
 };
 
 struct Vim_Operator_State {
@@ -2034,6 +2026,7 @@ struct Vim_Operator_State {
     Vim_Motion* motion;
 
     Vim_Visual_Selection selection;
+    Range_i64 total_range;
 
     u32 flags;
 };
@@ -2041,14 +2034,15 @@ struct Vim_Operator_State {
 #define vim_build_op_state(op, flags) vim_build_op_state_(app, view, buffer, handler, count, op, selection, flags)
 inline Vim_Operator_State vim_build_op_state_(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Binding_Handler* handler, i32 op_count, Vim_Operator* op, Vim_Visual_Selection selection, u32 flags) {
     Vim_Operator_State result = {};
-    result.app       = app;
-    result.handler   = handler;
-    result.view      = view;
-    result.buffer    = buffer;
-    result.op_count  = op_count;
-    result.op        = op;
-    result.selection = selection;
-    result.flags     = flags;
+    result.app         = app;
+    result.handler     = handler;
+    result.view        = view;
+    result.buffer      = buffer;
+    result.op_count    = op_count;
+    result.op          = op;
+    result.selection   = selection;
+    result.total_range = Ii64_neg_inf;
+    result.flags       = flags;
     return result;
 }
 
@@ -2062,29 +2056,46 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
 
     if (state->op_count > 0) {
         result = true;
+        b32 inclusive = true;
         if (state->selection.kind == VimSelectionKind_Range) {
             range = state->selection.range;
         } else if (state->selection.kind == VimSelectionKind_Line) {
-            range = maximize_visual_line_range(app, view, state->selection.range, false);
+            range = state->selection.range; maximize_visual_line_range(app, view, state->selection.range, true);
+            if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
+                inclusive = false;
+            }
         } else if (state->selection.kind == VimSelectionKind_Block) {
             result = vim_block_selection_consume_line(app, buffer, &state->selection, &range);
-        } else {
-            if (HasFlag(state->flags, VimOpFlag_QueryMotion)) {
-                if (!state->motion) {
-                    Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending, state->handler, &state->motion_count);
-                    state->motion = vim_unwrap_motion_query(query, state->op);
+        } else if (HasFlag(state->flags, VimOpFlag_QueryMotion)) {
+            if (!state->motion) {
+                Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending, state->handler, &state->motion_count);
+                state->motion = vim_unwrap_motion_query(query, state->op);
+            }
+
+            if (state->motion) {
+                if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
+                    // Note: Vim's behaviour is a little inconsistent with some motions in change for the sake of intuitiveness.
+                    if      (state->motion == vim_motion_inner_scope)        state->motion = vim_motion_inner_scope_leave_inner_line;
+                    else if (state->motion == vim_motion_inner_paren)        state->motion = vim_motion_inner_paren_leave_inner_line;
+                    else if (state->motion == vim_motion_to_empty_line_up)   state->motion = vim_motion_prior_to_empty_line_up;
+                    else if (state->motion == vim_motion_to_empty_line_down) state->motion = vim_motion_prior_to_empty_line_down;
                 }
 
-                if (state->motion) {
-                    Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, state->motion, view_get_cursor_pos(app, view), state->motion_count);
-                    range = mr.range;
-                } else {
-                    result = false;
-                }
+                Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, state->motion, view_get_cursor_pos(app, view), state->motion_count);
+                range = mr.range;
+                inclusive = mr.inclusive;
             } else {
                 result = false;
             }
+        } else {
+            range = Ii64(view_get_cursor_pos(app, view));
         }
+
+        if (inclusive) {
+            range.max = view_set_pos_by_character_delta(app, view, range.max, 1);
+        }
+
+        state->total_range = range_union(state->total_range, range);
         state->op_count--;
     }
 
@@ -2096,62 +2107,17 @@ internal VIM_OPERATOR(vim_delete) {
     Range_i64 range = {};
     Vim_Operator_State state = vim_build_op_state(vim_delete, VimOpFlag_QueryMotion);
     while (vim_get_operator_range(&state, &range)) {
-        vim_cut_range(app, view, buffer, range, true);
-    }
-}
-
-internal VIM_OPERATOR(vim_change_old) {
-    Range_i64 range = {};
-    b32 inclusive = false;
-	
-    i32 motion_count = 1;
-    Vim_Motion* motion = 0;
-	
-    if (selection.kind == VimSelectionKind_Range) {
-        range = selection.range;
-        inclusive = true;
-    } else if (selection.kind == VimSelectionKind_Line) {
-        range = maximize_visual_line_range(app, view, selection.range, false);
-        inclusive = true;
-    } else {
-        Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending, handler, &motion_count);
-        motion = vim_unwrap_motion_query(query, vim_change_old);
-		
-        // Note: Vim's behaviour is a little inconsistent with some motions in change for the sake of intuitiveness.
-        if      (motion == vim_motion_word)               motion = vim_motion_word_end;
-        else if (motion == vim_motion_inner_scope)        motion = vim_motion_inner_scope_leave_inner_line;
-        else if (motion == vim_motion_inner_paren)        motion = vim_motion_inner_paren_leave_inner_line;
-        else if (motion == vim_motion_to_empty_line_up)   motion = vim_motion_prior_to_empty_line_up;
-        else if (motion == vim_motion_to_empty_line_down) motion = vim_motion_prior_to_empty_line_down;
-    }
-	
-    b32 valid_motion = false;
-    for (i32 i = 0; i < count; i++) {
-        if (motion) {
-            Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, motion, view_get_cursor_pos(app, view), motion_count);
-            range = mr.range;
-            inclusive = mr.inclusive;
-        }
-		
-        if (range_size(range) + inclusive > 0) {
-            valid_motion = true;
-            vim_cut_range(app, view, buffer, range, inclusive);
-            auto_indent_line_at_cursor(app);
-        }
-    }
-	
-    if (valid_motion) {
-        vim_enter_insert_mode(app);
+        vim_cut_range(app, view, buffer, range, false);
     }
 }
 
 internal VIM_OPERATOR(vim_change) {
     b32 did_act = false;
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_change, VimOpFlag_QueryMotion);
+    Vim_Operator_State state = vim_build_op_state(vim_change, VimOpFlag_ChangeBehaviour|VimOpFlag_QueryMotion);
     while (vim_get_operator_range(&state, &range)) {
         did_act = true;
-        vim_cut_range(app, view, buffer, range, true);
+        vim_cut_range(app, view, buffer, range, false);
         auto_indent_line_at_cursor(app);
     }
 
@@ -2161,69 +2127,32 @@ internal VIM_OPERATOR(vim_change) {
 }
 
 internal VIM_OPERATOR(vim_replace) {
-	i64 pos = view_get_cursor_pos(app, view);
-	Range_i64 selection_range = Ii64(pos);
-	
-	if (selection.kind == VimSelectionKind_Range) {
-		selection_range = selection.range;
-	} else if (selection.kind == VimSelectionKind_Line) {
-		selection_range = maximize_visual_line_range(app, view, selection.range, false);
-	}
-
 	String_Const_u8 replace_char = vim_get_next_writable(app);
-	
-    if (selection.kind == VimSelectionKind_Block) {
-        Vim_Visual_Selection block_selection = selection;
-        while (vim_block_selection_consume_line(app, buffer, &block_selection, &selection_range)) {
-            for (i64 replace_cursor = selection_range.min; replace_cursor <= selection_range.max; replace_cursor++) {
-                Range_i64 replace_range = Ii64(replace_cursor, view_set_pos_by_character_delta(app, view, replace_cursor, 1));
-                buffer_replace_range(app, buffer, replace_range, replace_char);
-            }
-        }
 
-        view_set_cursor_and_preferred_x(app, view, seek_line_col(selection.first_line, selection.first_col));
-    } else {
-        for (i64 replace_cursor = selection_range.min; replace_cursor <= selection_range.max; replace_cursor++) {
-            Range_i64 replace_range = Ii64(replace_cursor, view_set_pos_by_character_delta(app, view, replace_cursor, 1));
-            buffer_replace_range(app, buffer, replace_range, replace_char);
+    Range_i64 range = {};
+    Vim_Operator_State state = vim_build_op_state(vim_replace, 0);
+    while (vim_get_operator_range(&state, &range)) {
+        for (i64 replace_cursor = range.min; replace_cursor < range.max; replace_cursor++) {
+            buffer_replace_range(app, buffer, Ii64(replace_cursor, view_set_pos_by_character_delta(app, view, replace_cursor, 1)), replace_char);
         }
-
-        view_set_cursor_and_preferred_x(app, view, seek_pos(selection_range.min));
     }
+
+    view_set_cursor_and_preferred_x(app, view, seek_pos(state.total_range.min));
 }
 
 internal VIM_OPERATOR(vim_yank) {
     Range_i64 range = {};
-    b32 inclusive = false;
-	
-    if (selection.kind == VimSelectionKind_Range) {
-        range = selection.range;
-        inclusive = true;
-    } else if (selection.kind == VimSelectionKind_Line) {
-        range = maximize_visual_line_range(app, view, selection.range, true);
-        inclusive = true;
-    } else {
-        i32 motion_count;
-        Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending, handler, &motion_count);
-        Vim_Motion* motion = vim_unwrap_motion_query(query, vim_yank);
-		
-        // Note: Vim's behaviour is a little inconsistent with some motions here for the sake of intuitiveness.
-        if (motion == vim_motion_word) {
-            motion = vim_motion_word_end;
+    Vim_Operator_State state = vim_build_op_state(vim_change, VimOpFlag_QueryMotion);
+    while (vim_get_operator_range(&state, &range)) {
+        Scratch_Block scratch(app);
+        String_Const_u8 string = push_buffer_range(app, scratch, buffer, range);
+        print_message(app, push_u8_stringf(scratch, "Yank range: { %lld, %lld }, String size: %llu\n", range.min, range.max, string.size));
+        print_message(app, string_u8_litexpr("Yanked: \""));
+        if (string.size) {
+            print_message(app, string);
+            clipboard_post(app, 0, string);
         }
-		
-        if (motion) {
-            Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, motion, view_get_cursor_pos(app, view), motion_count);
-            range = mr.range;
-            inclusive = mr.inclusive;
-        }
-    }
-	
-    if (range_size(range) + inclusive > 0) {
-        if (inclusive) {
-            range.max += 1;
-        }
-        clipboard_post_buffer_range(app, 0, buffer, range);
+        print_message(app, string_u8_litexpr("\"\n"));
     }
 }
 
