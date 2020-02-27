@@ -1,23 +1,28 @@
-function void vim_draw_cursor(Application_Links *app, View_ID view_id, b32 is_active_view, Buffer_ID buffer, Text_Layout_ID text_layout_id, f32 roundness, f32 outline_thickness, Vim_Mode mode) {
-    draw_highlight_range(app, view_id, buffer, text_layout_id, roundness);
+function void vim_draw_cursor(Application_Links *app, View_ID view, b32 is_active_view, Buffer_ID buffer, Text_Layout_ID text_layout_id, f32 roundness, f32 outline_thickness, Vim_Mode mode) {
+    draw_highlight_range(app, view, buffer, text_layout_id, roundness);
 
     i32 cursor_sub_id = default_cursor_sub_id();
     
-    i64 cursor_pos = view_get_cursor_pos(app, view_id);
-    i64 mark_pos = view_get_mark_pos(app, view_id);
+    i64 cursor_pos = view_get_cursor_pos(app, view);
     if (is_active_view) {
         if (is_vim_insert_mode(mode)) {
             draw_character_i_bar(app, text_layout_id, cursor_pos, fcolor_id(defcolor_cursor, cursor_sub_id));
         } else {
-            if (is_vim_visual_mode(mode)) {
-                Range_i64 range = Ii64(cursor_pos, mark_pos);
-                if (mode == VimMode_VisualLine) {
-                    range = maximize_visual_line_range(app, view_id, range, true);
+            Vim_Visual_Selection selection = vim_get_selection(app, view, buffer, true);
+
+            if (selection.kind) {
+                Range_i64 range = selection.range;
+                if (selection.kind == VimSelectionKind_Block) {
+                    while (vim_block_selection_consume_line(app, buffer, &selection, &range, true)) {
+                        draw_character_block(app, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
+                        paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
+                    }
+                } else {
+                    draw_character_block(app, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
+                    paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
                 }
-                range.max += 1;
-                draw_character_block(app, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
-                paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
             }
+
             draw_character_block(app, text_layout_id, cursor_pos, roundness, fcolor_id(defcolor_cursor, cursor_sub_id));
             paint_text_color_pos(app, text_layout_id, cursor_pos, fcolor_id(defcolor_at_cursor));
         }
@@ -348,14 +353,20 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
 
 function void vim_tick(Application_Links *app, Frame_Info frame_info) {
     default_tick(app, frame_info);
+
+    if (vim_state.played_macro) {
+        vim_state.played_macro = false;
+        history_group_end(vim_state.macro_history_group);
+    }
 	
+    // @TODO: Run this on all views/buffers
     View_ID view = get_active_view(app, Access_Visible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_Visible);
     if (buffer_exists(app, buffer)) {
         Buffer_ID scratch_buffer = get_buffer_by_name(app, string_u8_litexpr("*scratch*"), Access_Always);
         Managed_Scope scope = view_get_managed_scope(app, view);
         Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
-		
+
         if (vim_view->most_recent_known_buffer &&
             vim_view->most_recent_known_buffer != buffer &&
             vim_view->most_recent_known_buffer != scratch_buffer)
