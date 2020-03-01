@@ -1,3 +1,53 @@
+internal Rect_f32 rect_set_height(Rect_f32 rect, f32 height) {
+    rect.y0 = rect.y1 = 0.5f*(rect.y0 + rect.y1);
+    rect.y0 -= 0.5f*height;
+    rect.y1 += 0.5f*height;
+    return rect;
+}
+
+function void vim_draw_character_block_selection(Application_Links *app, Buffer_ID buffer, Text_Layout_ID layout, Range_i64 range, f32 roundness, ARGB_Color color) {
+    if (range.first < range.one_past_last) {
+        i64 i = range.first;
+        Rect_f32 first_rect = text_layout_character_on_screen(app, layout, i);
+        first_rect.y0 -= 1.0f;
+        first_rect.y1 += 1.0f;
+        i += 1;
+        Range_f32 y = rect_range_y(first_rect);
+        Range_f32 x = rect_range_x(first_rect);
+        for (; i < range.one_past_last; i += 1) {
+            if (character_is_newline(buffer_get_char(app, buffer, i))) {
+                continue;
+            }
+            Rect_f32 rect = text_layout_character_on_screen(app, layout, i);
+            rect.y0 -= 1.0f;
+            rect.y1 += 1.0f;
+            if (rect.x0 < rect.x1 && rect.y0 < rect.y1){
+                Range_f32 new_y = rect_range_y(rect);
+                Range_f32 new_x = rect_range_x(rect);
+                b32 joinable = false;
+                if (new_y == y && (range_overlap(x, new_x) || x.max == new_x.min || new_x.max == x.min)) {
+                    joinable = true;
+                }
+                
+                if (!joinable) {
+                    Rect_f32 rect_to_draw = Rf32(x, y);
+                    draw_rectangle(app, rect_to_draw, roundness, color);
+                    y = new_y;
+                    x = new_x;
+                } else {
+                    x = range_union(x, new_x);
+                }
+            }
+        }
+        draw_rectangle(app, Rf32(x, y), roundness, color);
+    }
+}
+
+function void vim_draw_character_block_selection(Application_Links *app, Buffer_ID buffer, Text_Layout_ID layout, Range_i64 range, f32 roundness, FColor color) {
+    ARGB_Color argb = fcolor_resolve(color);
+    vim_draw_character_block_selection(app, buffer, layout, range, roundness, argb);
+}
+
 function void vim_draw_cursor(Application_Links *app, View_ID view, b32 is_active_view, Buffer_ID buffer, Text_Layout_ID text_layout_id, f32 roundness, f32 outline_thickness, Vim_Mode mode) {
     draw_highlight_range(app, view, buffer, text_layout_id, roundness);
 
@@ -11,19 +61,14 @@ function void vim_draw_cursor(Application_Links *app, View_ID view, b32 is_activ
             Vim_Visual_Selection selection = vim_get_selection(app, view, buffer, true);
 
             if (selection.kind) {
-                Range_i64 range = selection.range;
-                if (selection.kind == VimSelectionKind_Block) {
-                    while (vim_block_selection_consume_line(app, buffer, &selection, &range, true)) {
-                        draw_character_block(app, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
-                        paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
-                    }
-                } else {
-                    draw_character_block(app, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
+                Range_i64 range = {};
+                while (vim_selection_consume_line(app, buffer, &selection, &range, true)) {
+                    vim_draw_character_block_selection(app, buffer, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
                     paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
                 }
             }
 
-            draw_character_block(app, text_layout_id, cursor_pos, roundness, fcolor_id(defcolor_cursor, cursor_sub_id));
+            vim_draw_character_block_selection(app, buffer, text_layout_id, Ii64(cursor_pos, cursor_pos + 1), roundness, fcolor_id(defcolor_cursor, cursor_sub_id));
             paint_text_color_pos(app, text_layout_id, cursor_pos, fcolor_id(defcolor_at_cursor));
         }
     } else {
@@ -299,8 +344,6 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
     *map_id_ptr = map_id;
 	
     Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
-    // TODO(snd): I don't know if scope attachments are zero initialised so better safe than sorry
-    block_zero_struct(vim_buffer);
     if (treat_as_code) {
         vim_buffer->flags |= VimBufferFlag_TreatAsCode;
     }
