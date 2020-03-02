@@ -1,10 +1,3 @@
-internal Rect_f32 rect_set_height(Rect_f32 rect, f32 height) {
-    rect.y0 = rect.y1 = 0.5f*(rect.y0 + rect.y1);
-    rect.y0 -= 0.5f*height;
-    rect.y1 += 0.5f*height;
-    return rect;
-}
-
 function void vim_draw_character_block_selection(Application_Links *app, Buffer_ID buffer, Text_Layout_ID layout, Range_i64 range, f32 roundness, ARGB_Color color) {
     if (range.first < range.one_past_last) {
         i64 i = range.first;
