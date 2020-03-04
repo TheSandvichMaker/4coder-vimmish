@@ -392,7 +392,7 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
 
     if (vim_state.played_macro) {
         vim_state.played_macro = false;
-        history_group_end(vim_state.macro_history_group);
+        history_group_end(vim_state.macro_history);
     }
 	
     // @TODO: Run this on all views/buffers

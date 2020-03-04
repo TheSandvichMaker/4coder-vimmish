@@ -24,11 +24,17 @@ CUSTOM_ID(attachment, vim_view_attachment);
 #define cast(...) (__VA_ARGS__)
 
 internal void string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
-    if (dest->cap < source.size) {
+    u64 new_cap = 0;
+    if (dest->cap < source.size || dest->cap > 4*source.size) {
+        new_cap = 2*source.size;
+    }
+
+    if (new_cap) {
         if (dest->str) {
             base_free(alloc, dest->str);
         }
-        Data memory = base_allocate(alloc, source.size);
+
+        Data memory = base_allocate(alloc, new_cap);
         dest->str = cast(u8*) memory.data;
         dest->cap = memory.size;
     }
@@ -41,12 +47,20 @@ internal void string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String
 
 internal void string_append_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
     u64 result_size = dest->size + source.size;
-    if (dest->cap < result_size) {
-        Data memory = base_allocate(alloc, result_size);
+
+    u64 new_cap = 0;
+    if (dest->cap < result_size || dest->cap > 4*result_size) {
+        new_cap = 2*result_size;
+    }
+
+    if (new_cap) {
+        Data memory = base_allocate(alloc, new_cap);
+
         if (dest->str) {
             block_copy(memory.data, dest->str, dest->size);
             base_free(alloc, dest->str);
         }
+
         dest->str = cast(u8*) memory.data;
         dest->cap = memory.size;
     }
@@ -57,6 +71,13 @@ internal void string_append_dynamic(Base_Allocator* alloc, String_u8* dest, Stri
 
     dest->size = result_size;
     block_copy(append_dest, source.str, source.size);
+}
+
+internal void string_free(Base_Allocator* alloc, String_u8* string) {
+    if (string->str) {
+        base_free(alloc, string->str);
+    }
+    block_zero_struct(string);
 }
 
 internal i64 get_vertical_pixel_move_pos(Application_Links *app, View_ID view, i64 pos, f32 pixels) {
@@ -143,15 +164,8 @@ struct Vim_Visual_Selection {
 struct Vim_Register {
     b32 from_block_copy;
     b32 append;
+    b32 read_only;
     String_u8 string;
-};
-
-struct Vim_Command_Macro_Recording {
-    b32 recording;
-    i64 keyboard_buffer_cursor_on_most_recent_input;
-    Range_i64 range;
-    History_Group history;
-    Vim_Visual_Selection selection;
 };
 
 struct Vim_Global_State {
@@ -159,12 +173,11 @@ struct Vim_Global_State {
     Heap heap;
     Base_Allocator alloc;
 
-    Vim_Command_Macro_Recording most_recent_command;
-    Vim_Command_Macro_Recording current_recording_command;
-    
-    Vim_Register registers[36]; // @Note: a-z + 0-9
-    Vim_Register unnamed_register;
-    Vim_Register clipboard_register;
+    Vim_Register registers[36];      // "a-z + "0-9
+    Vim_Register insert_register;    // ".
+    Vim_Register unnamed_register;   // ""
+    Vim_Register clipboard_register; // "+
+    Vim_Register command_register;   // for command repetition
     // @TODO: Vim_Register last_search_register;
     Vim_Register* active_register;
 
@@ -172,8 +185,15 @@ struct Vim_Global_State {
     b32           recording_macro;
     b32           played_macro;
     i64           current_macro_start_pos;
-    History_Group macro_history_group;
+    History_Group macro_history;
 
+    i64 command_start_pos;
+    b32 recording_command;
+    History_Group command_history;
+    Vim_Visual_Selection command_selection;
+
+    History_Group insert_history;
+    
     b32            search_case_sensitive;
     Scan_Direction search_direction;
 	
@@ -206,6 +226,8 @@ internal Vim_Register* vim_get_register(u8 register_char) {
         result = vim_state.registers + (register_char - '0');
     } else if (register_char == '+') {
         result = &vim_state.clipboard_register;
+    } else if (register_char == '.') {
+        result = &vim_state.insert_register;
     }
 
     if (result) {
@@ -215,15 +237,23 @@ internal Vim_Register* vim_get_register(u8 register_char) {
     return result;
 }
 
-internal void vim_write_register(Application_Links* app, Vim_Register* reg, String_Const_u8 string) {
-    if (reg->append) {
-        string_append_dynamic(&vim_state.alloc, &reg->string, string);
+internal b32 vim_write_register(Application_Links* app, Vim_Register* reg, String_Const_u8 string, b32 force_write = false) {
+    b32 result = true;
+
+    if (!force_write && reg->read_only) {
+        result = false;
     } else {
-        string_copy_dynamic(&vim_state.alloc, &reg->string, string);
+        if (reg->append) {
+            string_append_dynamic(&vim_state.alloc, &reg->string, string);
+        } else {
+            string_copy_dynamic(&vim_state.alloc, &reg->string, string);
+        }
+        if (reg == &vim_state.clipboard_register) {
+            clipboard_post(app, 0, reg->string.string);
+        }
     }
-    if (reg == &vim_state.clipboard_register) {
-        clipboard_post(app, 0, reg->string.string);
-    }
+
+    return result;
 }
 
 internal String_Const_u8 vim_read_register(Application_Links* app, Vim_Register* reg) {
@@ -1062,48 +1092,46 @@ CUSTOM_COMMAND_SIG(vim_replay_macro) {
 
             vim_state.most_recent_macro = reg;
             vim_state.played_macro = true;
-            vim_state.macro_history_group = history_group_begin(app, buffer);
+            vim_state.macro_history = history_group_begin(app, buffer);
         }
     }
 }
 
 internal void vim_command_begin(Application_Links* app, Buffer_ID buffer) {
-    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
-
-    if (recording->recording) {
+    if (vim_state.recording_command) {
         return;
     }
 	
-    recording->recording = true;
-    recording->history = history_group_begin(app, buffer);
+    vim_state.recording_command = true;
+    vim_state.command_history = history_group_begin(app, buffer);
 	
     if (get_current_input_is_virtual(app)) {
         return;
     }
-	
-    recording->range.min = recording->keyboard_buffer_cursor_on_most_recent_input;
 }
 
 internal void vim_command_end(Application_Links* app, b32 completed) {
-    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
-
-    if (!recording->recording) {
+    if (!vim_state.recording_command) {
         return;
     }
 	
-    recording->recording = false;
-    history_group_end(recording->history);
+    vim_state.recording_command = false;
+    history_group_end(vim_state.command_history);
 	
     if (get_current_input_is_virtual(app)) {
         return;
     }
 	
-    Buffer_ID buffer = get_keyboard_log_buffer(app);
-    Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
-    recording->range.max = cursor.pos;
-
     if (completed) {
-        vim_state.most_recent_command = vim_state.current_recording_command;
+        Buffer_ID buffer = get_keyboard_log_buffer(app);
+        Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
+
+        Range_i64 range = Ii64(vim_state.command_start_pos, cursor.pos);
+        
+        Scratch_Block scratch(app);
+        String_Const_u8 macro_string = push_buffer_range(app, scratch, buffer, range);
+
+        vim_write_register(app, &vim_state.command_register, macro_string);
     }
 }
 
@@ -1189,6 +1217,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
 
             if (is_vim_insert_mode(vim_buffer->mode)) {
                 snd_move_left_on_visual_line(app);
+                history_group_end(vim_state.insert_history);
             }
 
             User_Input in = get_current_input(app);
@@ -1196,23 +1225,27 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             vim_command_end(app, command_was_complete);
             vim_state.most_recent_character_seek.size = 0;
 
-            Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
-            if (HasFlag(vim_buffer->flags, VimBufferFlag_VisualBlockInsert) &&
-                cursor.line == vim_buffer->cursor_on_insert_mode_entry.line)
-            {
-                History_Record_Index history_index = buffer_history_get_current_state_index(app, buffer);
-                Record_Info history_record = buffer_history_get_record_info(app, buffer, history_index);
-                String_Const_u8 string = history_record.single_string_forward;
+            Buffer_Cursor start_cursor = vim_buffer->cursor_on_insert_mode_entry;
+            Buffer_Cursor end_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
 
+            History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
+            Record_Info history_record = buffer_history_get_record_info(app, buffer, current_history_index);
+
+            String_Const_u8 insert_string = history_record.single_string_forward;
+
+            vim_write_register(app, &vim_state.insert_register, insert_string, true);
+
+            if (HasFlag(vim_buffer->flags, VimBufferFlag_VisualBlockInsert) &&
+                end_cursor.line == vim_buffer->cursor_on_insert_mode_entry.line)
+            {
                 History_Group history = history_group_begin(app, buffer);
-                history.first = history_index;
+                history.first = current_history_index;
 
                 Range_i64 line_range = vim_buffer->visual_block_insert_line_range;
-                Buffer_Cursor base_cursor = vim_buffer->cursor_on_insert_mode_entry;
-                i64 insert_col = vim_buffer->visual_block_force_to_line_end ? max_i64 : base_cursor.col;
+                i64 insert_col = vim_buffer->visual_block_force_to_line_end ? max_i64 : start_cursor.col;
                 for (i64 line = line_range.first + 1; line < line_range.one_past_last; line++) {
                     Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(line, insert_col));
-                    buffer_replace_range(app, buffer, Ii64(insert_cursor.pos), string);
+                    buffer_replace_range(app, buffer, Ii64(insert_cursor.pos), insert_string);
                 }
 
                 history_group_end(history);
@@ -1225,6 +1258,8 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             } else {
                 *map_id = mapid_file;
             }
+
+            vim_state.insert_history = history_group_begin(app, buffer);
 
             if (is_vim_visual_mode(vim_buffer->mode)) {
                 Vim_Visual_Selection selection = vim_get_selection(app, view, buffer, false);
@@ -1778,18 +1813,12 @@ internal i64 vim_boundary_word(Application_Links* app, Buffer_ID buffer, Side si
 }
 
 CUSTOM_COMMAND_SIG(vim_repeat_most_recent_command) {
-    Vim_Command_Macro_Recording* recording = &vim_state.most_recent_command;
-
-    if (recording->recording || get_current_input_is_virtual(app)) {
+    if (vim_state.recording_command || get_current_input_is_virtual(app)) {
         return;
     }
 	
-    Buffer_ID keyboard_buffer = get_keyboard_log_buffer(app);
-	
-    Scratch_Block scratch(app, Scratch_Share);
-    String_Const_u8 macro = push_buffer_range(app, scratch, keyboard_buffer, recording->range);
-	
-    keyboard_macro_play(app, macro);
+    String_Const_u8 macro_string = vim_read_register(app, &vim_state.command_register);
+    keyboard_macro_play(app, macro_string);
 }
 
 internal void vim_seek_motion_result(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion_Result result) {
@@ -1840,12 +1869,11 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
         vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
     }
 	
-    Vim_Command_Macro_Recording* recording = &vim_state.current_recording_command;
-    if (!recording->recording && !get_current_input_is_virtual(app)) {
+    if (!vim_state.recording_command && !get_current_input_is_virtual(app)) {
         Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
         Buffer_Cursor cursor      = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
         Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
-        recording->keyboard_buffer_cursor_on_most_recent_input = back_cursor.pos;
+        vim_state.command_start_pos = back_cursor.pos;
     }
 	
     User_Input in = get_current_input(app);
@@ -1887,15 +1915,15 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
         }
 
         if (get_current_input_is_virtual(app)) {
-            Vim_Visual_Selection repeat_selection = vim_state.most_recent_command.selection;
+            Vim_Visual_Selection repeat_selection = vim_state.command_selection;
             if (repeat_selection.kind == VimSelectionKind_Block) {
                 selection.one_past_last_line = selection.first_line + (repeat_selection.one_past_last_line - repeat_selection.first_line);
                 selection.one_past_last_col  = selection.first_col  + (repeat_selection.one_past_last_col  - repeat_selection.first_col );
             } else {
                 selection.range.max = selection.range.min + range_size(repeat_selection.range);
             }
-        } else {
-            vim_state.current_recording_command.selection = selection;
+        } else if (vim_state.recording_command) {
+            vim_state.command_selection = selection;
         }
         
         switch (bind->kind) {
@@ -2868,7 +2896,11 @@ internal VIM_OPERATOR(vim_change) {
     }
 
     if (did_act) {
-        vim_enter_insert_mode(app);
+        if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
+            vim_enter_visual_insert_mode(app);
+        } else {
+            vim_enter_insert_mode(app);
+        }
     }
 }
 
@@ -3694,6 +3726,8 @@ internal void vim_init(Application_Links* app) {
     vim_state.arena = make_arena_system();
     heap_init(&vim_state.heap, &vim_state.arena);
     vim_state.alloc = base_allocator_on_heap(&vim_state.heap);
+
+    vim_state.insert_register.read_only = true;
 }
 
 #include "4coder_sandvich_hooks.cpp"
