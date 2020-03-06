@@ -25,8 +25,13 @@ CUSTOM_ID(attachment, vim_view_attachment);
 
 internal void string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
     u64 new_cap = 0;
-    if (dest->cap < source.size || dest->cap > 4*source.size) {
-        new_cap = 2*source.size;
+    if (dest->cap < source.size
+#if 0
+        || dest->cap > 4*source.size
+#endif
+    ) {
+        // new_cap = 2*source.size;
+        new_cap = source.size;
     }
 
     if (new_cap) {
@@ -49,8 +54,13 @@ internal void string_append_dynamic(Base_Allocator* alloc, String_u8* dest, Stri
     u64 result_size = dest->size + source.size;
 
     u64 new_cap = 0;
-    if (dest->cap < result_size || dest->cap > 4*result_size) {
-        new_cap = 2*result_size;
+    if (dest->cap < result_size
+#if 0
+        || dest->cap > 4*result_size
+#endif
+    ) {
+        // new_cap = 2*result_size;
+        new_cap = result_size;
     }
 
     if (new_cap) {
@@ -191,8 +201,6 @@ struct Vim_Global_State {
     b32 recording_command;
     History_Group command_history;
     Vim_Visual_Selection command_selection;
-
-    History_Group insert_history;
     
     b32            search_case_sensitive;
     Scan_Direction search_direction;
@@ -223,7 +231,7 @@ internal Vim_Register* vim_get_register(u8 register_char) {
         result = vim_state.registers + (register_char - 'A');
         append = true;
     } else if (register_char >= '0' && register_char <= '9') {
-        result = vim_state.registers + (register_char - '0');
+        result = vim_state.registers + 26 + (register_char - '0');
     } else if (register_char == '+') {
         result = &vim_state.clipboard_register;
     } else if (register_char == '.') {
@@ -240,38 +248,45 @@ internal Vim_Register* vim_get_register(u8 register_char) {
 internal b32 vim_write_register(Application_Links* app, Vim_Register* reg, String_Const_u8 string, b32 force_write = false) {
     b32 result = true;
 
-    if (!force_write && reg->read_only) {
-        result = false;
-    } else {
-        if (reg->append) {
-            string_append_dynamic(&vim_state.alloc, &reg->string, string);
+    if (reg) {
+        if (!force_write && reg->read_only) {
+            result = false;
         } else {
-            string_copy_dynamic(&vim_state.alloc, &reg->string, string);
+            if (reg->append) {
+                string_append_dynamic(&vim_state.alloc, &reg->string, string);
+            } else {
+                string_copy_dynamic(&vim_state.alloc, &reg->string, string);
+            }
+            if (reg == &vim_state.clipboard_register) {
+                clipboard_post(app, 0, reg->string.string);
+            }
         }
-        if (reg == &vim_state.clipboard_register) {
-            clipboard_post(app, 0, reg->string.string);
-        }
+    } else {
+        result = false;
     }
 
     return result;
 }
 
 internal String_Const_u8 vim_read_register(Application_Links* app, Vim_Register* reg) {
-    if (reg == &vim_state.clipboard_register) {
-        Scratch_Block scratch(app);
-        String_Const_u8 clipboard = push_clipboard_index(app, scratch, 0, 0);
+    String_Const_u8 result = SCu8();
 
-        vim_write_register(app, reg, clipboard);
+    if (reg) {
+        if (reg == &vim_state.clipboard_register) {
+            Scratch_Block scratch(app);
+            String_Const_u8 clipboard = push_clipboard_index(app, scratch, 0, 0);
+            vim_write_register(app, reg, clipboard);
+        }
+
+        result = reg->string.string;
     }
-
-    String_Const_u8 result = reg->string.string;
 
     return result;
 }
 
 enum Vim_Buffer_Flag {
-    VimBufferFlag_TreatAsCode       = 0x1,
-    VimBufferFlag_VisualBlockInsert = 0x2,
+    VimBufferFlag_TreatAsCode                            = 0x1,
+    VimBufferFlag_VisualBlockInsert                      = 0x2,
 };
 
 struct Vim_Buffer_Attachment {
@@ -280,6 +295,7 @@ struct Vim_Buffer_Attachment {
     b32 visual_block_force_to_line_end;
     Buffer_Cursor cursor_on_insert_mode_entry;
     Range_i64 visual_block_insert_line_range;
+    i32 history_index_post_change;
 };
 
 #define VIM_JUMP_HISTORY_SIZE 256
@@ -1194,6 +1210,17 @@ internal b32 vim_selection_consume_line(Application_Links* app, Buffer_ID buffer
     return result;
 }
 
+internal void vim_apply_undo_history_to_line_range(Application_Links* app, Buffer_ID buffer, History_Record_Index history_index, Record_Info record, Range_i64 line_range, i32 dont_use_backwards_history_prior_to_this_index = -1) {
+    Buffer_Cursor history_cursor = buffer_compute_cursor(app, buffer, seek_pos(record.single_first));
+    for (i64 line = line_range.first + 1; line < line_range.one_past_last; line++) {
+        Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(line, history_cursor.col));
+        if (history_index >= dont_use_backwards_history_prior_to_this_index && record.single_string_backward.size) {
+            buffer_replace_range(app, buffer, Ii64_size(insert_cursor.pos, record.single_string_backward.size), SCu8());
+        }
+        buffer_replace_range(app, buffer, Ii64(insert_cursor.pos), record.single_string_forward);
+    }
+}
+
 internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append = false) {
     u32 access_flags = Access_ReadVisible;
     if (is_vim_insert_mode(mode)) {
@@ -1217,7 +1244,6 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
 
             if (is_vim_insert_mode(vim_buffer->mode)) {
                 snd_move_left_on_visual_line(app);
-                history_group_end(vim_state.insert_history);
             }
 
             User_Input in = get_current_input(app);
@@ -1231,9 +1257,8 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
             Record_Info history_record = buffer_history_get_record_info(app, buffer, current_history_index);
 
-            String_Const_u8 insert_string = history_record.single_string_forward;
-
-            vim_write_register(app, &vim_state.insert_register, insert_string, true);
+            // @TODO: Do I really care to support this? The "insert string" is impossible to define properly anyway.
+            // vim_write_register(app, &vim_state.insert_register, insert_string, true);
 
             if (HasFlag(vim_buffer->flags, VimBufferFlag_VisualBlockInsert) &&
                 end_cursor.line == vim_buffer->cursor_on_insert_mode_entry.line)
@@ -1242,10 +1267,18 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                 history.first = current_history_index;
 
                 Range_i64 line_range = vim_buffer->visual_block_insert_line_range;
-                i64 insert_col = vim_buffer->visual_block_force_to_line_end ? max_i64 : start_cursor.col;
-                for (i64 line = line_range.first + 1; line < line_range.one_past_last; line++) {
-                    Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(line, insert_col));
-                    buffer_replace_range(app, buffer, Ii64(insert_cursor.pos), insert_string);
+                for (i32 history_index = vim_state.command_history.first; history_index <= current_history_index; history_index++) {
+                    Record_Info record = buffer_history_get_record_info(app, buffer, history_index);
+                    if (record.kind == RecordKind_Group) {
+                        for (i32 sub_index = 0; sub_index < record.group_count; sub_index++) {
+                            Record_Info sub_record = buffer_history_get_group_sub_record(app, buffer, history_index, sub_index);
+                            Assert(sub_record.kind == RecordKind_Single);
+
+                            vim_apply_undo_history_to_line_range(app, buffer, history_index, sub_record, line_range, vim_buffer->history_index_post_change);
+                        }
+                    } else {
+                        vim_apply_undo_history_to_line_range(app, buffer, history_index, record, line_range, vim_buffer->history_index_post_change);
+                    }
                 }
 
                 history_group_end(history);
@@ -1258,8 +1291,6 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             } else {
                 *map_id = mapid_file;
             }
-
-            vim_state.insert_history = history_group_begin(app, buffer);
 
             if (is_vim_visual_mode(vim_buffer->mode)) {
                 Vim_Visual_Selection selection = vim_get_selection(app, view, buffer, false);
@@ -2207,7 +2238,7 @@ internal VIM_MOTION(vim_motion_word_end) {
     Vim_Motion_Result result = vim_null_motion(start_pos);
     result.seek_pos = scan(app, push_boundary_list(scratch, boundary_token), buffer, Scan_Forward, start_pos + 1) - 1; // @Unicode
     result.range = Ii64(start_pos, result.seek_pos);
-    result.flags |= VimMotionFlag_Inclusive;
+    result.flags |= VimMotionFlag_Inclusive|VimMotionFlag_SetPreferredX;
     return result;
 }
 
@@ -2849,7 +2880,7 @@ internal VIM_OPERATOR(vim_delete) {
 
     String_Const_u8 cut_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
     if (cut_string.size) {
-        clipboard_post(app, 0, cut_string);
+        vim_write_register(app, vim_state.active_register, cut_string);
     }
 }
 
@@ -2892,11 +2923,14 @@ internal VIM_OPERATOR(vim_change) {
 
     String_Const_u8 cut_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
     if (cut_string.size) {
-        clipboard_post(app, 0, cut_string);
+        vim_write_register(app, vim_state.active_register, cut_string);
     }
 
     if (did_act) {
         if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
+            History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
+            Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
+            vim_buffer->history_index_post_change = current_history_index;
             vim_enter_visual_insert_mode(app);
         } else {
             vim_enter_insert_mode(app);
@@ -2947,6 +2981,7 @@ internal VIM_OPERATOR(vim_yank) {
     String_Const_u8 final_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
     if (final_string.size) {
         vim_write_register(app, vim_state.active_register, final_string);
+        vim_write_register(app, vim_get_register('0'), final_string);
     }
 }
 
