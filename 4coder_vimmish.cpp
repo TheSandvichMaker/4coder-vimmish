@@ -256,6 +256,32 @@ struct Vim_Register {
     String_u8 string;
 };
 
+enum Vim_Search_Flag {
+    VimSearchFlag_CaseSensitive = 0x1,
+    VimSearchFlag_WholeWord     = 0x2,
+};
+
+global u32 vim_search_mode_cycle[] = {
+    0,
+    VimSearchFlag_CaseSensitive,
+    VimSearchFlag_WholeWord,
+    VimSearchFlag_CaseSensitive|VimSearchFlag_WholeWord,
+};
+
+global String_Const_u8 vim_search_mode_prompt_forward[] = {
+    string_u8_litexpr("I-Search: "),
+    string_u8_litexpr("I-Search (Case Sensitive): "),
+    string_u8_litexpr("I-Search (Whole Word): "),
+    string_u8_litexpr("I-Search (Case Sensitive, Whole Word): "),
+};
+
+global String_Const_u8 vim_search_mode_prompt_reverse[] = {
+    string_u8_litexpr("Reverse-I-Search: "),
+    string_u8_litexpr("Reverse-I-Search (Case Sensitive): "),
+    string_u8_litexpr("Reverse-I-Search (Whole Word): "),
+    string_u8_litexpr("Reverse-I-Search (Case Sensitive, Whole Word): "),
+};
+
 struct Vim_Global_State {
     Arena                arena;
     Heap                 heap;
@@ -282,8 +308,9 @@ struct Vim_Global_State {
     Vim_Visual_Selection command_selection;
     
     b32                  search_show_highlight;
-    b32                  search_case_sensitive;
+    u32                  search_flags;
     Scan_Direction       search_direction;
+    u32                  search_mode_index;
 	
     b32                  character_seek_show_highlight;
     Scan_Direction       character_seek_highlight_dir;
@@ -293,7 +320,8 @@ struct Vim_Global_State {
     b32                  most_recent_character_seek_till;
     b32                  most_recent_character_seek_inclusive;
 	
-    u8                   chord_bar_storage[32];
+    b32                  capture_queries_into_chord_bar;
+    u8                   chord_bar_storage[64];
     String_u8            chord_bar;
 
     i32                  definition_stack_count;
@@ -693,6 +721,14 @@ struct Vim_Key_Binding {
     };
 };
 
+internal void vim_append_chord_bar(String_Const_u8 string) {
+    String_Const_u8 append_string = string;
+    if (string_match(string, string_u8_litexpr(" "))) {
+        append_string = string_u8_litexpr("<SPACE>");
+    }
+    string_append(&vim_state.chord_bar, append_string);
+}
+
 internal void vim_clear_chord_bar() {
     vim_state.chord_bar.size = 0;
 }
@@ -828,6 +864,9 @@ internal i64 vim_query_number(Application_Links* app, VimQueryMode mode, b32 han
             i32 digit = input_to_digit(in);
 			
             if (digit >= 0) {
+                if (vim_state.capture_queries_into_chord_bar) {
+                    string_append_character(&vim_state.chord_bar, '0' + cast(u8) digit);
+                }
                 // @TODO: Check if these cases are actually correct
                 if (result > (max_i64 / 10 - digit)) {
                     result = max_i64;
@@ -860,11 +899,7 @@ internal User_Input vim_get_next_key(Application_Links* app) {
 }
 
 internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
-    User_Input in = {};
-    do {
-        in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
-        if (in.abort) break;
-    } while (key_code_to_vim_modifier(in.event.key.code));
+    User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
     String_Const_u8 result = to_writable(&in);
     return result;
 }
@@ -880,11 +915,15 @@ internal Vim_Key vim_get_key_from_current_input(Application_Links* app) {
 
         leave_current_input_unhandled(app);
 
-        in = get_next_input(app, EventProperty_TextInsert, EventProperty_ViewActivation|EventProperty_Exit);
+        in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
     }
 
     if (in.event.kind == InputEventKind_TextInsert) {
         String_Const_u8 writable = to_writable(&in);
+
+        if (vim_state.capture_queries_into_chord_bar) {
+            vim_append_chord_bar(writable);
+        }
 
         u32 codepoint = 0;
         if (writable.size) {
@@ -908,11 +947,15 @@ internal Vim_Key vim_get_key_from_next_input(Application_Links* app) {
 
         leave_current_input_unhandled(app);
 
-        in = get_next_input(app, EventProperty_TextInsert, EventProperty_ViewActivation|EventProperty_Exit);
+        in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
     }
 
     if (in.event.kind == InputEventKind_TextInsert) {
         String_Const_u8 writable = to_writable(&in);
+
+        if (vim_state.capture_queries_into_chord_bar) {
+            vim_append_chord_bar(writable);
+        }
 
         u32 codepoint = 0;
         if (writable.size) {
@@ -1520,6 +1563,8 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
 	
     User_Input in = get_current_input(app);
 
+    vim_state.capture_queries_into_chord_bar = true;
+
     i64 queried_number = vim_query_number(app, VimQuery_CurrentInput);
     i32 op_count = cast(i32) clamp(1, queried_number, 256);
     
@@ -1592,6 +1637,8 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
     }
 
     vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
+    vim_state.capture_queries_into_chord_bar = false;
+    vim_state.chord_bar.size = 0;
 }
 
 internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Handler* handler, Vim_Key_Sequence binding_sequence) {
@@ -2317,15 +2364,15 @@ internal VIM_MOTION(vim_motion_prior_to_empty_line_down) {
     return result;
 }
 
-internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Scan_Direction direction, i64 pos, String_Const_u8 query, b32 case_sensitive, b32 recursed = false) {
-    Range_i64 result = {};
+internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Scan_Direction direction, i64 pos, String_Const_u8 query, u32 flags, b32 recursed = false) {
+    Range_i64 result = Ii64();
 
     b32 found_match = false;
     i64 buffer_size = buffer_get_size(app, buffer);
     switch (direction) {
         case Scan_Forward: {
             i64 new_pos = 0;
-            if (case_sensitive) {
+            if (HasFlag(flags, VimSearchFlag_CaseSensitive)) {
                 seek_string_forward(app, buffer, pos - 1, 0, query, &new_pos);
             } else {
                 seek_string_insensitive_forward(app, buffer, pos - 1, 0, query, &new_pos);
@@ -2338,7 +2385,7 @@ internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view
         
         case Scan_Backward: {
             i64 new_pos = 0;
-            if (case_sensitive) {
+            if (HasFlag(flags, VimSearchFlag_CaseSensitive)) {
                 seek_string_backward(app, buffer, pos + 1, 0, query, &new_pos);
             } else {
                 seek_string_insensitive_backward(app, buffer, pos + 1, 0, query, &new_pos);
@@ -2350,10 +2397,18 @@ internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view
         } break;
     }
 
+    if (found_match && HasFlag(flags, VimSearchFlag_WholeWord)) {
+        Range_i64 enclosing_word = enclose_alpha_numeric_underscore_utf8(app, buffer, result);
+        if (enclosing_word.min != result.min || enclosing_word.max != result.max) {
+            found_match = false;
+            result = Ii64();
+        }
+    }
+
     if (!recursed && !found_match) {
         switch (direction) {
-            case Scan_Forward:  { result = vim_search_once_internal(app, view, buffer, direction, 0, query, case_sensitive, true); } break;
-            case Scan_Backward: { result = vim_search_once_internal(app, view, buffer, direction, buffer_size, query, case_sensitive, true); } break;
+            case Scan_Forward:  { result = vim_search_once_internal(app, view, buffer, direction, 0, query, flags, true); } break;
+            case Scan_Backward: { result = vim_search_once_internal(app, view, buffer, direction, buffer_size, query, flags, true); } break;
         }
     }
 
@@ -2368,7 +2423,7 @@ internal void vim_search_once(Application_Links* app, View_ID view, Buffer_ID bu
     isearch__update_highlight(app, view, range);
 }
 
-internal void vim_isearch_internal(Application_Links *app, View_ID view, Buffer_ID buffer, Scan_Direction start_scan, i64 first_pos, String_Const_u8 query_init, b32 search_immediately, b32 case_sensitive) {
+internal void vim_isearch_internal(Application_Links *app, View_ID view, Buffer_ID buffer, Scan_Direction start_scan, i64 first_pos, String_Const_u8 query_init, b32 search_immediately, u32 mode_index) {
     Query_Bar_Group group(app);
     Query_Bar bar = {};
     if (!start_query_bar(app, &bar, 0)) {
@@ -2381,24 +2436,23 @@ internal void vim_isearch_internal(Application_Links *app, View_ID view, Buffer_
     u8 bar_string_space[256];
     bar.string = SCu8(bar_string_space, query_init.size);
     block_copy(bar.string.str, query_init.str, query_init.size);
-    
-    String_Const_u8 isearch_str = string_u8_litexpr("I-Search: ");
-    String_Const_u8 rsearch_str = string_u8_litexpr("Reverse-I-Search: ");
 
-    vim_state.search_case_sensitive = case_sensitive;
+    Assert(mode_index < ArrayCount(vim_search_mode_cycle));
+    vim_state.search_mode_index = mode_index;
+    vim_state.search_flags = vim_search_mode_cycle[vim_state.search_mode_index];
     
     User_Input in = {};
     for (;;) {
         if (search_immediately) {
             vim_write_register(app, &vim_state.last_search_register, bar.string);
-            vim_search_once(app, view, buffer, scan, pos, bar.string, case_sensitive);
+            vim_search_once(app, view, buffer, scan, pos, bar.string, vim_state.search_flags);
             break;
         }
 
         if (scan == Scan_Forward) {
-            bar.prompt = isearch_str;
+            bar.prompt = vim_search_mode_prompt_forward[vim_state.search_mode_index];
         } else if (scan == Scan_Backward) {
-            bar.prompt = rsearch_str;
+            bar.prompt = vim_search_mode_prompt_reverse[vim_state.search_mode_index];
         }
         
         in = get_next_input(app, EventPropertyGroup_AnyKeyboardEvent, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
@@ -2409,10 +2463,18 @@ internal void vim_isearch_internal(Application_Links *app, View_ID view, Buffer_
         String_Const_u8 string = to_writable(&in);
         
         b32 string_change = false;
-        if (match_key_code(&in, KeyCode_Return) || match_key_code(&in, KeyCode_Tab)) {
+        if (match_key_code(&in, KeyCode_Tab)) {
+            vim_state.search_mode_index++;
+            if (vim_state.search_mode_index >= ArrayCount(vim_search_mode_cycle)) {
+                vim_state.search_mode_index = 0;
+            }
+            vim_state.search_flags = vim_search_mode_cycle[vim_state.search_mode_index];
+            continue;
+        } else if (match_key_code(&in, KeyCode_Return)) {
             Input_Modifier_Set* mods = &in.event.key.modifiers;
             if (has_modifier(mods, KeyCode_Control)) {
                 bar.string = vim_read_register(app, &vim_state.last_search_register);
+                string_change = true;
             } else {
                 vim_write_register(app, &vim_state.last_search_register, bar.string);
                 break;
@@ -2457,9 +2519,9 @@ internal void vim_isearch_internal(Application_Links *app, View_ID view, Buffer_
         }
         
         if (string_change) {
-            vim_search_once(app, view, buffer, scan, pos, bar.string, case_sensitive);
+            vim_search_once(app, view, buffer, scan, pos, bar.string, vim_state.search_flags);
         } else if (do_scan_action) {
-            vim_search_once(app, view, buffer, change_scan, pos, bar.string, case_sensitive);
+            vim_search_once(app, view, buffer, change_scan, pos, bar.string, vim_state.search_flags);
         } else if (do_scroll_wheel) {
             mouse_wheel_scroll(app);
         } else {
@@ -2481,7 +2543,7 @@ CUSTOM_COMMAND_SIG(vim_isearch) {
     }
 
     vim_state.search_direction = Scan_Forward;
-    vim_isearch_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view) + vim_state.search_direction, SCu8(), false, false);
+    vim_isearch_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view) + vim_state.search_direction, SCu8(), false, 0);
 }
 
 CUSTOM_COMMAND_SIG(vim_isearch_backward) {
@@ -2492,7 +2554,7 @@ CUSTOM_COMMAND_SIG(vim_isearch_backward) {
     }
 
     vim_state.search_direction = Scan_Backward;
-    vim_isearch_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view) - vim_state.search_direction, SCu8(), false, false);
+    vim_isearch_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view) - vim_state.search_direction, SCu8(), false, 0);
 }
 
 internal void vim_select_range(Application_Links* app, View_ID view, Range_i64 range) {
@@ -2515,7 +2577,7 @@ internal void vim_isearch_repeat_internal(Application_Links* app, Scan_Direction
     }
 
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
-    Range_i64 range = vim_search_once_internal(app, view, buffer, search_direction, start_pos, last_search, vim_state.search_case_sensitive);
+    Range_i64 range = vim_search_once_internal(app, view, buffer, search_direction, start_pos, last_search, vim_state.search_flags);
 
     if (select) {
         vim_select_range(app, view, range);
@@ -2554,7 +2616,7 @@ internal void vim_isearch_selection_internal(Application_Links* app, Scan_Direct
         String_Const_u8 query_init = push_buffer_range(app, scratch, buffer, selection.range);
 		
         vim_state.search_direction = dir;
-        vim_isearch_internal(app, view, buffer, vim_state.search_direction, selection.range.min, query_init, true, true);
+        vim_isearch_internal(app, view, buffer, vim_state.search_direction, selection.range.min, query_init, true, 3);
     }
     
     vim_enter_normal_mode(app);
@@ -2579,7 +2641,7 @@ CUSTOM_COMMAND_SIG(vim_isearch_word_under_cursor) {
 
     vim_state.search_direction = Scan_Forward;
     if (under_cursor.size) {
-        vim_isearch_internal(app, view, buffer, vim_state.search_direction, range_under_cursor.min + vim_state.search_direction, under_cursor, true, true);
+        vim_isearch_internal(app, view, buffer, vim_state.search_direction, range_under_cursor.min + vim_state.search_direction, under_cursor, true, 3);
     }
 }
 
@@ -2678,7 +2740,7 @@ internal VIM_MOTION(vim_motion_isearch_repeat_forward) {
                     VimMotionFlag_AlwaysSeek;
 
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
-    Range_i64 range = vim_search_once_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_case_sensitive);
+    Range_i64 range = vim_search_once_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
 
     result.seek_pos = range.min;
     result.range = range;
@@ -2692,7 +2754,7 @@ internal VIM_MOTION(vim_motion_isearch_repeat_backward) {
                     VimMotionFlag_AlwaysSeek;
 
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
-    Range_i64 range = vim_search_once_internal(app, view, buffer, -vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_case_sensitive);
+    Range_i64 range = vim_search_once_internal(app, view, buffer, -vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
 
     result.seek_pos = range.min;
     result.range = range;
@@ -3901,7 +3963,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
     // NOTE(allen): Cursor shape
     Face_Metrics metrics = get_face_metrics(app, face_id);
     f32 cursor_roundness = VIM_CURSOR_ROUNDNESS;
-    f32 mark_thickness = 2.f;
+    f32 mark_thickness = 2.0f;
 	
     Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
 
@@ -3909,7 +3971,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
         // Note: Vim Search highlight
         i64 pos = visible_range.min;
         while (pos < visible_range.max) {
-            Range_i64 highlight_range = vim_search_once_internal(app, view_id, buffer, Scan_Forward, pos, vim_state.last_search_register.string.string, vim_state.search_case_sensitive, true);
+            Range_i64 highlight_range = vim_search_once_internal(app, view_id, buffer, Scan_Forward, pos, vim_state.last_search_register.string.string, vim_state.search_flags, true);
             if (!range_size(highlight_range)) {
                 break;
             }
@@ -3924,14 +3986,11 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
         i64 pos = view_get_cursor_pos(app, view_id);
         while (range_contains(visible_range, pos)) {
             Vim_Motion_Result mr = vim_motion_seek_character_internal(app, view_id, buffer, pos, SCu8(), vim_state.character_seek_highlight_dir, vim_state.most_recent_character_seek_inclusive, true);
-
             if (mr.seek_pos == pos) {
                 break;
             }
-
-            pos = mr.seek_pos;
-
             vim_draw_character_block_selection(app, buffer, text_layout_id, Ii64_size(mr.seek_pos, vim_state.most_recent_character_seek.size), cursor_roundness, fcolor_id(defcolor_highlight));
+            pos = mr.seek_pos;
         }
     }
 #endif
@@ -3951,6 +4010,9 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
 function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_ID buffer, Face_ID face_id, Rect_f32 bar) {
     Scratch_Block scratch(app);
 	
+    View_ID active_view = get_active_view(app, Access_Always);
+    b32 is_active_view = (active_view == view_id);
+
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
 	
@@ -4019,6 +4081,10 @@ function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_
             string_append(&str, string_u8_litexpr("!"));
         }
         push_fancy_string(scratch, &list, pop2_color, str.string);
+    }
+
+    if (is_active_view) {
+        push_fancy_stringf(scratch, &list, base_color, "   %.*s", string_expand(vim_state.chord_bar));
     }
 	
     Vec2_f32 p = bar.p0 + V2f32(2.f, 2.f);
