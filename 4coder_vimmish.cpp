@@ -2840,7 +2840,7 @@ enum Vim_DCY {
     VimDCY_Yank,
 };
 
-internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, Vim_Motion* motion = 0) {
+internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, b32 query_motion, Vim_Motion* motion = 0) {
     // @TODO: This whole function is weird and stupid...
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
@@ -2852,7 +2852,7 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Hand
     b32 did_act = false;
     Range_i64 range = {};
 
-    u32 op_flags = VimOpFlag_QueryMotion;
+    u32 op_flags = query_motion ? VimOpFlag_QueryMotion : 0;
     if (mode == VimDCY_Change) op_flags |= VimOpFlag_ChangeBehaviour;
 
     Scratch_Block scratch(app);
@@ -2911,29 +2911,33 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Hand
 }
 
 internal VIM_OPERATOR(vim_delete) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete, true);
+}
+
+internal VIM_OPERATOR(vim_delete_character) {
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
 }
 
 internal VIM_OPERATOR(vim_change) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change, true);
 }
 
 internal VIM_OPERATOR(vim_yank) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, true);
 }
 
 internal VIM_OPERATOR(vim_delete_eol) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_change_eol) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_yank_eol) {
     // Note: This is vim's default behaviour (cuz it's vi compatible)
-    // vim_delete_change_or_yank(app, handler, view, buffer, selection, count, vim_yank, vim_motion_enclose_line_textual);
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, vim_motion_line_end_textual);
+    // vim_delete_change_or_yank(app, handler, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
+    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
 }
 
 #else
@@ -4548,6 +4552,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
 
 		vim_bind_operator(&vim_map_normal, vim_change,                                        vim_key(KeyCode_C));
         vim_bind_operator(&vim_map_normal, vim_delete,                                        vim_key(KeyCode_D));
+        vim_bind_operator(&vim_map_normal, vim_delete_character,                              vim_key(KeyCode_X));
         vim_bind_operator(&vim_map_normal, vim_yank,                                          vim_key(KeyCode_Y));
 		vim_bind_operator(&vim_map_normal, vim_change_eol,                                    vim_key(KeyCode_C, KeyCode_Shift));
         vim_bind_operator(&vim_map_normal, vim_delete_eol,                                    vim_key(KeyCode_D, KeyCode_Shift));
@@ -4571,7 +4576,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         vim_bind_operator(&vim_map_normal, vim_miblo_increment_sequence,                      vim_key(KeyCode_G), vim_key(KeyCode_A, KeyCode_Control));
         vim_bind_operator(&vim_map_normal, vim_miblo_decrement_sequence,                      vim_key(KeyCode_G), vim_key(KeyCode_X, KeyCode_Control));
         
-        vim_bind_text_command(&vim_map_normal, delete_char,                                   vim_key(KeyCode_X));
         vim_bind_text_command(&vim_map_normal, vim_enter_insert_mode,                         vim_key(KeyCode_I));
         vim_bind_text_command(&vim_map_normal, vim_enter_insert_sol_mode,                     vim_key(KeyCode_I, KeyCode_Shift));
         vim_bind_text_command(&vim_map_normal, vim_enter_append_mode,                         vim_key(KeyCode_A));
