@@ -1,7 +1,6 @@
 #include "4coder_default_include.cpp"
 
 #define VIM_CURSOR_ROUNDNESS 0
-
 #include "4coder_vimmish.cpp"
 
 #include "generated/managed_id_metadata.cpp"

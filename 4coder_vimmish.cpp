@@ -5,16 +5,14 @@
     #include "4coder_default_include.cpp"
 
     // You could override some defines here:
-    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 0 / 1                                           [default: 1]
-    // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK 0 / 1                                           [default: 1]
-    // #define VIM_AUTO_INDENT_ON_PASTE 0 / 1                                                    [default: 1]
-    // #define VIM_DEFAULT_REGISTER unnamed_register / clipboard_register                        [default: unnamed_register]
-    // #define VIM_JUMP_HISTORY_SIZE [integer]                                                   [default: 256]
-    // #define VIM_MAXIMUM_OP_COUNT [integer]                                                    [default: 256]
-    // #define VIM_FILEBAR_NORMAL_COLOR [expression that evaluates to an ARGB_Color]             [default: fcolor_resolve(fcolor_id(defcolor_bar))]
-    // #define VIM_FILEBAR_INSERT_COLOR [expression that evaluates to an ARGB_Color]             [default: fcolor_resolve(fcolor_id(defcolor_bar))]
-    // #define VIM_FILEBAR_VISUAL_COLOR [expression that evaluates to an ARGB_Color]             [default: fcolor_resolve(fcolor_id(defcolor_bar))]
-    // #define VIM_CURSOR_ROUNDNESS [expression that evaluates to a float]                       [default: (metrics.normal_advance*0.5f)*0.9f]
+    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 0 / 1                       [default: 1]
+    // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK 0 / 1                       [default: 1]
+    // #define VIM_AUTO_INDENT_ON_PASTE 0 / 1                                [default: 1]
+    // #define VIM_USE_CUSTOM_COLORS 0 / 1                                   [default: 1]
+    // #define VIM_DEFAULT_REGISTER unnamed_register / clipboard_register    [default: unnamed_register]
+    // #define VIM_JUMP_HISTORY_SIZE [integer]                               [default: 256]
+    // #define VIM_MAXIMUM_OP_COUNT [integer]                                [default: 256]
+    // #define VIM_CURSOR_ROUNDNESS [expression that evaluates to a float]   [default: (metrics.normal_advance*0.5f)*0.9f]
 
     #include "4coder_vimmish.cpp"
 
@@ -37,22 +35,22 @@
         vim_set_default_hooks(app);
         vim_setup_default_mapping(app, &framework_mapping);
     }
+
+    // If you enable VIM_USE_CUSTOM_COLORS, you will be able to use the following colors in your theme file:
+    // defcolor_vim_bar_normal    -- filebar color in normal mode
+    // defcolor_vim_bar_insert    -- filebar color in insert mode
+    // defcolor_vim_bar_visual    -- filebar color in visual mode
+    // defcolor_vim_cursor_normal -- cursor color in normal mode
+    // defcolor_vim_cursor_insert -- cursor color in insert mode
+    // defcolor_vim_cursor_visual -- cursor color in visual mode
 */
 
 // @TODO: Make window movements not come from an include
 #include "clearfeld_windmove.cpp"
 
 //
+// User-Configuable Defines
 //
-//
-
-// Things to maybe do:
-// - Insert line comments on return
-// - Disable mouse during insert mode (to avoid stupid palming of my touchpad)
-// - Fix whatever's wrong with selection on command repeat
-// - People like that thing where they can use some textual keys to escape from insert mode,
-//   I don't really get it but I'm not against implementing it
-// - Explore how to enable virtual whitespace with these vimmish things
 
 #ifndef VIM_USE_CHARACTER_SEEK_HIGHLIGHTS
 #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 1
@@ -90,8 +88,24 @@
 //
 //
 
+// Things to maybe do:
+// - Insert line comments on return
+// - Disable mouse during insert mode (to avoid stupid palming of my touchpad)
+// - Fix whatever's wrong with selection on command repeat
+// - People like that thing where they can use some textual keys to escape from insert mode,
+//   I don't really get it but I'm not against implementing it
+// - Explore how to enable virtual whitespace with these vimmish things
+
+//
+// Internal Defines
+//
+
 #define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // Note: I don't really think this is good for my use, but it's here if you like things that complicate your life
 #define VIM_PRINT_COMMANDS 0
+
+//
+// Managed IDs
+//
 
 CUSTOM_ID(command_map, vim_mapid_shared);
 CUSTOM_ID(command_map, vim_mapid_normal);
