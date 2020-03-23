@@ -4,15 +4,15 @@
 /* USAGE:
     #include "4coder_default_include.cpp"
 
-    // You could override some defines here:
-    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 0 / 1                       [default: 1]
-    // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK 0 / 1                       [default: 1]
-    // #define VIM_AUTO_INDENT_ON_PASTE 0 / 1                                [default: 1]
-    // #define VIM_USE_CUSTOM_COLORS 0 / 1                                   [default: 1]
-    // #define VIM_DEFAULT_REGISTER unnamed_register / clipboard_register    [default: unnamed_register]
-    // #define VIM_JUMP_HISTORY_SIZE [integer]                               [default: 256]
-    // #define VIM_MAXIMUM_OP_COUNT [integer]                                [default: 256]
-    // #define VIM_CURSOR_ROUNDNESS [expression that evaluates to a float]   [default: (metrics.normal_advance*0.5f)*0.9f]
+    You could override some defines here:
+    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS [0/ 1]                                     [default: 1]
+    // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK [0/ 1]                                     [default: 1]
+    // #define VIM_AUTO_INDENT_ON_PASTE          [0/ 1]                                     [default: 1]
+    // #define VIM_USE_CUSTOM_COLORS             [0/ 1]                                     [default: 1]
+    // #define VIM_DEFAULT_REGISTER              [unnamed_register / clipboard_register]    [default: unnamed_register]
+    // #define VIM_JUMP_HISTORY_SIZE             [integer]                                  [default: 256]
+    // #define VIM_MAXIMUM_OP_COUNT              [integer]                                  [default: 256]
+    // #define VIM_CURSOR_ROUNDNESS              [expression that evaluates to a float]     [default: (metrics.normal_advance*0.5f)*0.9f]
 
     #include "4coder_vimmish.cpp"
 
@@ -37,9 +37,9 @@
     }
 
     // If you enable VIM_USE_CUSTOM_COLORS, you will be able to use the following colors in your theme file:
-    // defcolor_vim_bar_normal    -- filebar color in normal mode
-    // defcolor_vim_bar_insert    -- filebar color in insert mode
-    // defcolor_vim_bar_visual    -- filebar color in visual mode
+    defcolor_vim_bar_normal -- filebar color in normal mode
+    // defcolor_vim_bar_insert -- filebar color in insert mode
+    // defcolor_vim_bar_visual -- filebar color in visual mode
     // defcolor_vim_cursor_normal -- cursor color in normal mode
     // defcolor_vim_cursor_insert -- cursor color in insert mode
     // defcolor_vim_cursor_visual -- cursor color in visual mode
@@ -95,6 +95,7 @@
 // - People like that thing where they can use some textual keys to escape from insert mode,
 //   I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
+// - Fix visual block append
 
 //
 // Internal Defines
@@ -166,7 +167,7 @@ internal void vim_string_append_dynamic(Base_Allocator* alloc, String_u8* dest, 
     u64 result_size = dest->size + source.size;
 
     u64 new_cap = 0;
-
+   
 #if VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD
     if (dest->cap < source.size || dest->cap > 4*source.size) {
         new_cap = 2*source.size;
@@ -181,21 +182,21 @@ internal void vim_string_append_dynamic(Base_Allocator* alloc, String_u8* dest, 
         new_cap = Max(256, new_cap);
         if (new_cap != dest->cap) {
             Data memory = base_allocate(alloc, new_cap);
-
+   
             if (dest->str) {
                 block_copy(memory.data, dest->str, dest->size);
                 base_free(alloc, dest->str);
             }
-
+   
             dest->str = cast(u8*) memory.data;
             dest->cap = memory.size;
         }
     }
-
+   
     Assert(dest->cap >= result_size);
-
+   
     u8* append_dest = dest->str + dest->size;
-
+   
     dest->size = result_size;
     block_copy(append_dest, source.str, source.size);
 }
@@ -896,9 +897,7 @@ internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
 internal i64 vim_query_number(Application_Links* app, VimQueryMode mode, b32 handle_sign = false) {
     i64 result = 0;
 	
-    User_Input in = mode == VimQuery_CurrentInput ?
-                    get_current_input(app) :
-                    vim_get_next_key(app);
+    User_Input in = mode == VimQuery_CurrentInput ? get_current_input(app) : vim_get_next_key(app);
 
     if (in.abort) {
         return result;
@@ -1186,9 +1185,11 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
     }
 
     switch (vim_buffer->mode) {
-        case VimMode_Visual:      { selection.kind = VimSelectionKind_Range; } break;
+        case VimMode_Visual: {
+            selection.kind = VimSelectionKind_Range;
+        } break;
 
-        case VimMode_VisualLine:  {
+        case VimMode_VisualLine: {
             selection.kind = VimSelectionKind_Line; 
             selection.range.first.col = 0;
             selection.range.one_past_last.col = max_i32;
@@ -1311,7 +1312,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
 
             if (vim_buffer->mode == VimMode_VisualInsert && end_cursor.line == vim_buffer->insert_cursor.line) {
                 // @TODO: I could investigate if Batch_Edit could simplify this hot mess, but I'm not sure it could.
-                // The undo history stuff isn't order independent, after all.
+                //        The undo history stuff isn't order independent, after all.
 
                 History_Record_Index insert_history_index  = vim_buffer->insert_history_index;
                 History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
@@ -1372,9 +1373,11 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
 
             vim_state.most_recent_character_seek.size = 0;
 
-            // @TODO: I don't love this, it's a bit obtuse
             User_Input in = get_current_input(app);
+            
+            // @TODO: I don't love this, it's a bit obtuse
             b32 command_was_complete = (vim_buffer->mode == VimMode_Insert || !match_key_code(&in, KeyCode_Escape));
+            
             vim_command_end(app, command_was_complete);
         } break;
 		
@@ -1521,28 +1524,6 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_block_mode) {
     vim_enter_mode(app, VimMode_VisualBlock);
 }
 
-internal void vim_seek_motion_result(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion_Result result) {
-    i64 old_line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-    i64 new_line = get_line_number_from_pos(app, buffer, result.seek_pos);
-
-    if (HasFlag(result.flags, VimMotionFlag_IsJump) && !HasFlag(result.flags, VimMotionFlag_LogJumpPostSeek)) {
-        if (old_line != new_line) {
-            vim_log_jump_history(app);
-        }
-    }
-
-    Buffer_Seek new_pos = seek_pos(result.seek_pos);
-    if (HasFlag(result.flags, VimMotionFlag_SetPreferredX)) {
-        view_set_cursor_and_preferred_x(app, view, new_pos);
-    } else {
-        view_set_cursor(app, view, new_pos);
-    }
-
-    if (HasFlag(result.flags, VimMotionFlag_IsJump) && HasFlag(result.flags, VimMotionFlag_LogJumpPostSeek)) {
-        vim_log_jump_history(app);
-    }
-}
-
 internal Vim_Motion_Result vim_execute_motion(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion* motion, i64 start_pos, i32 count, b32 count_was_set) {
     if (count < 0) count = 1;
     Vim_Motion_Result result = vim_null_motion(start_pos);
@@ -1557,6 +1538,28 @@ internal Vim_Motion_Result vim_execute_motion(Application_Links* app, View_ID vi
         }
     }
     return result;
+}
+
+internal void vim_seek_motion_result(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion_Result result) {
+    i64 old_line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
+    i64 new_line = get_line_number_from_pos(app, buffer, result.seek_pos);
+    
+    if (HasFlag(result.flags, VimMotionFlag_IsJump) && !HasFlag(result.flags, VimMotionFlag_LogJumpPostSeek)) {
+        if (old_line != new_line) {
+            vim_log_jump_history(app);
+        }
+    }
+    
+    Buffer_Seek new_pos = seek_pos(result.seek_pos);
+    if (HasFlag(result.flags, VimMotionFlag_SetPreferredX)) {
+        view_set_cursor_and_preferred_x(app, view, new_pos);
+    } else {
+        view_set_cursor(app, view, new_pos);
+    }
+    
+    if (HasFlag(result.flags, VimMotionFlag_IsJump) && HasFlag(result.flags, VimMotionFlag_LogJumpPostSeek)) {
+        vim_log_jump_history(app);
+    }
 }
 
 internal Vim_Binding_Handler* vim_get_handler_for_mode(Vim_Mode mode) {
@@ -1816,7 +1819,7 @@ internal VIM_MOTION(vim_motion_up) {
 }
 
 // @TODO: My word motions seem kind of stupidly complicated, but I keep running into little limitations of the built in helper boundary functions and such,
-// so at some point I should put some effort into going a bit lower level and simplifying these. But until then, they work.
+//        so at some point I should put some effort into going a bit lower level and simplifying these. But until then, they work.
 
 internal i64 vim_boundary_word(Application_Links* app, Buffer_ID buffer, Side side, Scan_Direction direction, i64 pos) {
     i64 result = 0;
@@ -2036,6 +2039,8 @@ internal VIM_MOTION(vim_motion_enclose_line_textual) {
 }
 
 internal VIM_MOTION(vim_motion_scope) {
+    // NOTE: One minor disappointment regarding this function is that because it uses tokens, it doesn't work inside comments.
+    //       That's lame. I want it to work inside comments.
 	Vim_Motion_Result result = vim_null_motion(start_pos);
     result.flags |= VimMotionFlag_Inclusive|
                     VimMotionFlag_IsJump|
@@ -2274,7 +2279,6 @@ internal Vim_Motion_Result vim_motion_seek_character_internal(Application_Links*
         }
 		
         if (new_input) {
-            // @TODO: This seems rather laboured just to store a unicode character.
             if (!vim_state.most_recent_character_seek.cap) {
                 vim_state.most_recent_character_seek = Su8(vim_state.most_recent_character_seek_storage, 0, ArrayCount(vim_state.most_recent_character_seek_storage));
             }
@@ -2913,7 +2917,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
 
             if (state->motion) {
                 if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
-                    // Note: Vim's behaviour is a little inconsistent with some motions in change for the sake of intuitiveness.
+                    // Note: Vim's behaviour is a little inconsistent with some motions wnen using the change operator for the sake of intuitiveness.
                     if      (state->motion == vim_motion_word)               state->motion = vim_motion_word_end;
                     else if (state->motion == vim_motion_inner_scope)        state->motion = vim_motion_inner_scope_leave_inner_line;
                     else if (state->motion == vim_motion_inner_paren)        state->motion = vim_motion_inner_paren_leave_inner_line;
@@ -3064,7 +3068,7 @@ internal VIM_OPERATOR(vim_change_eol) {
 }
 
 internal VIM_OPERATOR(vim_yank_eol) {
-    // Note: This is vim's default behaviour (cuz it's vi compatible)
+    // NOTE: This is vim's default behaviour (cuz it's vi compatible)
     // vim_delete_change_or_yank(app, handler, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
     vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
 }
@@ -3416,6 +3420,7 @@ internal VIM_OPERATOR(vim_auto_indent) {
 }
 
 internal void vim_shift_indentation_of_line(Application_Links* app, Buffer_ID buffer, i64 line, Scan_Direction dir) {
+    // @TODO: Support adding/removing indentation in the middle of lines (using visual block and whatnot)
     i32 indent_width = global_config.indent_width;
 
     Scratch_Block scratch(app);
@@ -3504,7 +3509,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
         String_Match match = buffer_seek_string(app, buffer, align_target, Scan_Forward, seek_range.min);
         if (match.buffer == buffer && HasFlag(match.flags, StringMatch_CaseSensitive)) {
             if (align_after_target) {
-                // Note: Offset the seek position to skip over the range of the matched string, just in case for some reason
+                // NOTE: Offset the seek position to skip over the range of the matched string, just in case for some reason
                 // the user asked to align a string with spaces in it, I guess.
                 i64 range_delta = range_size(match.range) - 1;
                 match.range.min += range_delta;
@@ -3525,7 +3530,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
 			
             if (furthest_align_cursor.col != -1) {
                 if (align_cursor.col != furthest_align_cursor.col) {
-                    // Note: Well, we didn't align yet. But we will.
+                    // NOTE: Well, we didn't align yet. But we will.
                     did_align = true;
                 }
             }
@@ -3640,7 +3645,12 @@ internal b32 vim_line_comment_starts_at_position(Application_Links *app, Buffer_
     return result;
 }
 
-enum VimToggleCommentMode {
+enum Vim_Comment_Style {
+    VimCommentStyle_Indented,
+    VimCommentStyle_LineStart,
+};
+
+enum Vim_Toggle_Comment_Mode {
     VimToggleComment_Always,
     VimToggleComment_Comment,
     VimToggleComment_Uncomment,
@@ -3649,10 +3659,9 @@ enum VimToggleCommentMode {
 // @Temporary @Hack: This isn't really a good way to do anything
 global String_Const_u8 vim_most_recent_spotted_line_comment_token;
 
-internal VimToggleCommentMode vim_toggle_line_comment_internal(Application_Links* app, Buffer_ID buffer, i64 line, VimToggleCommentMode mode = VimToggleComment_Always) {
-    // @TODO: Add the option to add line comments to the line start instead, without shifting the commented
-    //        contents if there's enough room in the indentation
-    VimToggleCommentMode result = mode;
+internal Vim_Toggle_Comment_Mode vim_toggle_line_comment_internal(Application_Links* app, Buffer_ID buffer, i64 line, Vim_Comment_Style style, Vim_Toggle_Comment_Mode mode = VimToggleComment_Always) {
+    // @TODO: Make all of this behave correctly with tab indentation as well
+    Vim_Toggle_Comment_Mode result = mode;
 
     b32 comment   = (mode == VimToggleComment_Always) ||
                     (mode == VimToggleComment_Comment);
@@ -3661,50 +3670,114 @@ internal VimToggleCommentMode vim_toggle_line_comment_internal(Application_Links
 
     Scratch_Block scratch(app);
     String_Const_u8 comment_token = SCu8();
+    i64 line_start_pos = get_line_start_pos(app, buffer, line);
     i64 line_comment_pos = get_pos_past_lead_whitespace_from_line_number(app, buffer, line);
+    i64 line_comment_col = line_comment_pos - line_start_pos;
 
     if (uncomment && vim_line_comment_starts_at_position(app, buffer, line_comment_pos, &comment_token)) {
-        vim_most_recent_spotted_line_comment_token = comment_token;
         result = VimToggleComment_Uncomment;
-        Range_i64 replace_range = Ii64_size(line_comment_pos, comment_token.size);
-        // @TODO: Fix this to handle comments without a whitespace after them because these boundary scan things end up never being what I want
-        replace_range.max = scan(app, push_boundary_list(scratch, boundary_non_whitespace), buffer, Scan_Forward, replace_range.max - 1) + 1;
-        buffer_replace_range(app, buffer, replace_range, SCu8());
+        
+        vim_most_recent_spotted_line_comment_token = comment_token;
+        
+        String_Const_u8 line_text = push_buffer_line(app, scratch, buffer, line);
+        line_text = string_skip(line_text, line_comment_col + comment_token.size);
+        
+        i64 whitespace_post_comment_count = string_find_first_non_whitespace(line_text);
+        
+        Range_i64 replace_range;
+        String_Const_u8 replace_string;
+        
+        if (line_start_pos == line_comment_pos && whitespace_post_comment_count > 1) {
+            // VimCommentStyle_LineStart style uncomment
+            replace_range = Ii64_size(line_comment_pos, comment_token.size);
+            replace_string.str  = push_array(scratch, u8, comment_token.size);
+            replace_string.size = comment_token.size;
+            block_fill_u8(replace_string.str, replace_string.size, ' ');
+        } else {
+            // VimCommentStyle_Indented style uncomment
+            replace_range = Ii64_size(line_comment_pos, comment_token.size + whitespace_post_comment_count);
+            replace_string = SCu8();
+        }
+        
+        buffer_replace_range(app, buffer, replace_range, replace_string);
     } else if (comment) {
         // @TODO: Figure out a way to decide on the comment token kind to use
         comment_token = vim_most_recent_spotted_line_comment_token.size ? vim_most_recent_spotted_line_comment_token : vim_recognised_line_comment_tokens[0];
-        if (!line_is_blank(app, buffer, line)) {
+        
+        // @TODO: Make this user exposed
+        b32 comment_empty_lines = true;
+        
+        if (comment_empty_lines || !line_is_blank(app, buffer, line)) {
             result = VimToggleComment_Comment;
-            i64 insert_pos = get_pos_past_lead_whitespace_from_line_number(app, buffer, line);
+            
+            Range_i64 insert_range = Ii64();
+            switch (style) {
+                case VimCommentStyle_Indented: {
+                    insert_range = Ii64(line_comment_pos);
+                } break;
+                
+                case VimCommentStyle_LineStart: {
+                    if (line_comment_pos - cast(i64) comment_token.size + 1 > line_start_pos) {
+                        insert_range = Ii64_size(line_start_pos, comment_token.size + 1);
+                    } else {
+                        insert_range = Ii64(line_start_pos);
+                    }
+                } break;
+                
+                default: {
+                    InvalidPath;
+                } break;
+            }
+            
             String_Const_u8 insert_string = push_u8_stringf(scratch, "%.*s ", string_expand(comment_token));
-            buffer_replace_range(app, buffer, Ii64(insert_pos), insert_string);
+            buffer_replace_range(app, buffer, insert_range, insert_string);
         }
     }
     
     return result;
 }
 
-internal VIM_OPERATOR(vim_toggle_line_comment) {
-    VimToggleCommentMode mode = VimToggleComment_Always;
+internal VIM_OPERATOR(vim_toggle_line_comment_indented_style) {
+    Vim_Comment_Style       style = VimCommentStyle_Indented;
+    Vim_Toggle_Comment_Mode mode  = VimToggleComment_Always;
     if (selection.kind) {
         Range_i64 range = {};
-        Vim_Operator_State state = vim_build_op_state(vim_toggle_line_comment, 0);
+        Vim_Operator_State state = vim_build_op_state(vim_toggle_line_comment_indented_style, 0);
         while (vim_get_operator_range(&state, &range)) {
             Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
             for (i64 line = line_range.min; line < line_range.max; line++) {
-                mode = vim_toggle_line_comment_internal(app, buffer, line, mode);
+                mode = vim_toggle_line_comment_internal(app, buffer, line, style, mode);
             }
         }
     } else {
         i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        mode = vim_toggle_line_comment_internal(app, buffer, line, mode);
+        mode = vim_toggle_line_comment_internal(app, buffer, line, style, mode);
     }
+}
+
+internal VIM_OPERATOR(vim_toggle_line_comment_line_start_style) {
+    Vim_Comment_Style       style = VimCommentStyle_LineStart;
+    Vim_Toggle_Comment_Mode mode  = VimToggleComment_Always;
+    if (selection.kind) {
+        Range_i64 range = {};
+        Vim_Operator_State state = vim_build_op_state(vim_toggle_line_comment_line_start_style, 0);
+        while (vim_get_operator_range(&state, &range)) {
+            Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
+            for (i64 line = line_range.min; line < line_range.max; line++) {
+                mode = vim_toggle_line_comment_internal(app, buffer, line, style, mode);
+            }
+        }
+    } else {
+        i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
+        mode = vim_toggle_line_comment_internal(app, buffer, line, style, mode);
+    }
+    
 }
 
 internal void vim_join_line_internal(Application_Links* app, Buffer_ID buffer, i64 line) {
     i64 next_line = line + 1;
     if (is_valid_line(app, buffer, next_line)) {
-        vim_toggle_line_comment_internal(app, buffer, next_line, VimToggleComment_Uncomment);
+        vim_toggle_line_comment_internal(app, buffer, next_line, VimCommentStyle_LineStart, VimToggleComment_Uncomment);
         i64 line_end_pos = get_line_end_pos(app, buffer, line);
         i64 join_pos = get_pos_past_lead_whitespace_from_line_number(app, buffer, next_line);
         buffer_replace_range(app, buffer, Ii64(line_end_pos, join_pos), SCu8(" "));
@@ -4127,9 +4200,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
         if (global_config.use_comment_keyword){
             Comment_Highlight_Pair pairs[] = {
                 { string_u8_litexpr("NOTE"), finalize_color(defcolor_comment_pop, 0) },
-                { string_u8_litexpr("Note"), finalize_color(defcolor_comment_pop, 0) },
                 { string_u8_litexpr("TODO"), finalize_color(defcolor_comment_pop, 1) },
-                { string_u8_litexpr("Todo"), finalize_color(defcolor_comment_pop, 1) },
             };
             draw_comment_highlights(app, buffer, text_layout_id, &token_array, pairs, ArrayCount(pairs));
         }
@@ -4185,7 +4256,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
     Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
 
     if (vim_state.search_show_highlight) {
-        // Note: Vim Search highlight
+        // NOTE: Vim Search highlight
         i64 pos = visible_range.min;
         while (pos < visible_range.max) {
             Range_i64 highlight_range = vim_search_once_internal(app, view_id, buffer, Scan_Forward, pos, vim_state.last_search_register.string.string, vim_state.search_flags, true);
@@ -4199,7 +4270,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
 
 #if VIM_USE_CHARACTER_SEEK_HIGHLIGHTS
     if (is_active_view && vim_state.character_seek_show_highlight) {
-        // Note: Vim Character Seek highlight
+        // NOTE: Vim Character Seek highlight
         i64 pos = view_get_cursor_pos(app, view_id);
         while (range_contains(visible_range, pos)) {
             Vim_Motion_Result mr = vim_motion_seek_character_internal(app, view_id, buffer, pos, SCu8(), vim_state.character_seek_highlight_dir, vim_state.most_recent_character_seek_inclusive, true);
@@ -4305,6 +4376,7 @@ function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_
         push_fancy_string(scratch, &list, pop2_color, str.string);
     }
 
+    // @TODO: Display for when you're recording a macro
     if (is_active_view) {
         push_fancy_stringf(scratch, &list, base_color, "   %.*s", string_expand(vim_state.chord_bar));
     }
@@ -4625,14 +4697,12 @@ function void vim_set_default_colors(Application_Links *app) {
 
     Arena *arena = &global_theme_arena;
     
-    default_color_table.arrays[defcolor_vim_bar_normal] = make_colors(arena, 0xFF888888);
-    default_color_table.arrays[defcolor_vim_bar_insert] = make_colors(arena, 0xFF888888);
-    default_color_table.arrays[defcolor_vim_bar_visual] = make_colors(arena, 0xFF888888);
-    default_color_table.arrays[defcolor_vim_cursor_normal] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
-    default_color_table.arrays[defcolor_vim_cursor_insert] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
-    default_color_table.arrays[defcolor_vim_cursor_visual] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
-
-    active_color_table = default_color_table;
+    active_color_table.arrays[defcolor_vim_bar_normal] = make_colors(arena, 0xFF888888);
+    active_color_table.arrays[defcolor_vim_bar_insert] = make_colors(arena, 0xFF888888);
+    active_color_table.arrays[defcolor_vim_bar_visual] = make_colors(arena, 0xFF888888);
+    active_color_table.arrays[defcolor_vim_cursor_normal] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
+    active_color_table.arrays[defcolor_vim_cursor_insert] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
+    active_color_table.arrays[defcolor_vim_cursor_visual] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
 }
 
 //
@@ -4858,7 +4928,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
 
         vim_bind_generic_command(&vim_map_normal, vim_register,                               vim_char('"'));
 
-		vim_bind_operator(&vim_map_normal, vim_toggle_line_comment,                           vim_key(KeyCode_L, KeyCode_Shift));
 		vim_bind_operator(&vim_map_normal, vim_change,                                        vim_key(KeyCode_C));
         vim_bind_operator(&vim_map_normal, vim_delete,                                        vim_key(KeyCode_D));
         vim_bind_operator(&vim_map_normal, vim_delete_character,                              vim_key(KeyCode_X));
@@ -4945,7 +5014,9 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         vim_bind_generic_command(&vim_map_normal, q,                                          vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_Q));
         vim_bind_generic_command(&vim_map_normal, qa,                                         vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_Q, KeyCode_Shift));
         vim_bind_generic_command(&vim_map_normal, save,                                       vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_W));
-
+        
+		vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_line_start_style,          vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
+        
         vim_bind_generic_command(&vim_map_normal, noh,                                        vim_leader, vim_key(KeyCode_N));
 
         vim_bind_generic_command(&vim_map_normal, vim_isearch_repeat_select_forward,          vim_key(KeyCode_G), vim_key(KeyCode_N));
