@@ -131,6 +131,10 @@ CUSTOM_ID(colors, defcolor_vim_cursor_visual);
 
 #define cast(type) (type)
 
+internal b32 vim_character_is_newline(char c) {
+    return c == '\r' || c == '\n';
+}
+
 internal void vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
     u64 new_cap = 0;
 
@@ -1593,9 +1597,6 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
     }
 
     vim_state.character_seek_show_highlight = false;
-    
-    User_Input in = get_current_input(app);
-
     vim_state.capture_queries_into_chord_bar = true;
 
     i64 queried_number = vim_query_number(app, VimQuery_CurrentInput);
@@ -1763,10 +1764,6 @@ internal void vim_unbind_(Vim_Binding_Handler* handler, Vim_Key_Sequence sequenc
     }
 }
 
-internal b32 vim_character_is_newline(char c) {
-    return c == '\r' || c == '\n';
-}
-
 internal i64 vim_boundary_whitespace(Application_Links *app, Buffer_ID buffer, Side side, Scan_Direction direction, i64 pos) {
     return(boundary_predicate(app, buffer, side, direction, pos, &character_predicate_whitespace));
 }
@@ -1781,6 +1778,7 @@ CUSTOM_COMMAND_SIG(vim_repeat_most_recent_command) {
     String_Const_u8 macro_string = vim_read_register(app, &vim_state.command_register);
     keyboard_macro_play(app, macro_string);
 }
+
 internal VIM_MOTION(vim_motion_left) {
     Vim_Motion_Result result = {};
     result.seek_pos = view_set_pos_by_character_delta(app, view, start_pos, -1);
@@ -1805,7 +1803,7 @@ internal VIM_MOTION(vim_motion_down) {
     result.seek_pos = end_pos;
     result.range = Ii64(start_pos, result.seek_pos);
     result.range.min = get_line_start_pos(app, buffer, start_cursor.line);
-    result.range.max = get_line_start_pos(app, buffer, start_cursor.line + 1);
+    result.range.max = get_line_end_pos(app, buffer, start_cursor.line + 1);
     return result;
 }
 
@@ -1816,8 +1814,8 @@ internal VIM_MOTION(vim_motion_up) {
     i64 end_pos = view_pos_at_relative_xy(app, view, start_cursor.line - 1, V2f32(preferred_x, 0.0f));
     result.seek_pos = end_pos;
     result.range = Ii64(start_pos, result.seek_pos);
-    result.range.min = get_line_start_pos(app, buffer, start_cursor.line);
-    result.range.max = get_line_start_pos(app, buffer, start_cursor.line + 1);
+    result.range.min = get_line_start_pos(app, buffer, start_cursor.line - 1);
+    result.range.max = get_line_end_pos(app, buffer, start_cursor.line);
     return result;
     
 }
