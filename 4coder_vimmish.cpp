@@ -96,6 +96,7 @@
 //   I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
 // - Create a non-stopgap solution to case sensitive / whole word searches (tab during search query would be better suited to auto complete)
+// - Do stuff with 0-9 registers (or yeet them because... does anybody use these?)
 
 //
 // Internal Defines
@@ -481,7 +482,7 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
     Scratch_Block scratch(app);
     for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
         i32 jumps_left = vim_view->jump_history_one_past_max - jump_index;
-        Tiny_Jump test_jump = vim_view->jump_history[jump_index];
+        Tiny_Jump test_jump = vim_view->jump_history[jump_index % ArrayCount(vim_view->jump_history)];
         if (test_jump.buffer == buffer) {
             i64 test_line = get_line_number_from_pos(app, buffer, test_jump.pos); // @Speed
             if (test_line == line) {
@@ -492,7 +493,7 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
                     // @Speed
                     for (i32 shift = 0; shift < jumps_left - 1; shift++) {
                         i32 shift_index = jump_index + shift;
-                        vim_view->jump_history[shift_index] = vim_view->jump_history[shift_index + 1];
+                        vim_view->jump_history[shift_index % ArrayCount(vim_view->jump_history)] = vim_view->jump_history[(shift_index + 1) % ArrayCount(vim_view->jump_history)];
                     }
                 }
             
