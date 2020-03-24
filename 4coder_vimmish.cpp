@@ -95,6 +95,7 @@
 // - People like that thing where they can use some textual keys to escape from insert mode,
 //   I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
+// - Create a non-stopgap solution to case sensitive / whole word searches (tab during search query would be better suited to auto complete)
 
 //
 // Internal Defines
@@ -434,7 +435,7 @@ internal String_Const_u8 vim_read_register(Application_Links* app, Vim_Register*
         if (reg == &vim_state.clipboard_register) {
             Scratch_Block scratch(app);
             String_Const_u8 clipboard = push_clipboard_index(scratch, 0, 0);
-            // vim_write_register(app, reg, clipboard);
+            vim_write_register(app, reg, clipboard);
         }
 
         result = reg->string.string;
