@@ -2145,7 +2145,7 @@ function b32 vim_find_surrounding_nest(Application_Links *app, Buffer_ID buffer,
     return result;
 }
 
-internal Vim_Motion_Result vim_motion_inner_nest_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, Find_Nest_Flag flags, b32 leave_inner_line) {
+internal Vim_Motion_Result vim_motion_inner_nest_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, Find_Nest_Flag flags, b32 leave_inner_line, b32 select_inner_block) {
     Vim_Motion_Result result = vim_null_motion(start_pos);
     result.flags |= VimMotionFlag_SetPreferredX;
     
@@ -2155,11 +2155,22 @@ internal Vim_Motion_Result vim_motion_inner_nest_internal(Application_Links* app
         i64 min_line = get_line_number_from_pos(app, buffer, min);
         i64 max_line = get_line_number_from_pos(app, buffer, max);
         if (min_line != max_line) {
-            max = get_line_end_pos(app, buffer, max_line - 1);
+            Scratch_Block scratch(app);
+            String_Const_u8 left_of_max = push_buffer_range(app, scratch, buffer, Ii64(get_line_start_pos(app, buffer, max_line), max));
+            if (string_find_first_non_whitespace(left_of_max) == left_of_max.size) {
+                max = get_line_end_pos(app, buffer, max_line - 1);
+                if (!leave_inner_line) {
+                    result.flags |= VimMotionFlag_Inclusive;
+                }
+            }
             result.seek_pos = max;
-            if (leave_inner_line && (max_line - 1) > min_line) {
-                min = get_pos_past_lead_whitespace_from_line_number(app, buffer, min_line + 1);
-                result.seek_pos = min;
+            if ((max_line - 1) > min_line) {
+                if (select_inner_block) {
+                    min = get_line_start_pos(app, buffer, min_line + 1);
+                } else if (leave_inner_line) {
+                    min = get_pos_past_lead_whitespace_from_line_number(app, buffer, min_line + 1);
+                    result.seek_pos = min;
+                }
             }
         }
         result.range = Ii64(min, max);
@@ -2168,20 +2179,28 @@ internal Vim_Motion_Result vim_motion_inner_nest_internal(Application_Links* app
     return result;
 }
 
-internal VIM_MOTION(vim_motion_inner_scope_leave_inner_line) {
-    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, true);
+internal VIM_MOTION(vim_motion_inner_scope_change) {
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, true, false);
+}
+
+internal VIM_MOTION(vim_motion_inner_scope_delete) {
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, false, false);
 }
 
 internal VIM_MOTION(vim_motion_inner_scope) {
-    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, false);
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, false, true);
 }
 
-internal VIM_MOTION(vim_motion_inner_paren_leave_inner_line) {
-    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true);
+internal VIM_MOTION(vim_motion_inner_paren_change) {
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true, false);
+}
+
+internal VIM_MOTION(vim_motion_inner_paren_delete) {
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true, false);
 }
 
 internal VIM_MOTION(vim_motion_inner_paren) {
-    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, false);
+    return vim_motion_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, false, true);
 }
 
 internal VIM_MOTION(vim_motion_inner_double_quotes) {
@@ -2900,6 +2919,7 @@ internal Vim_Motion* vim_unwrap_motion_query(Vim_Key_Binding* query, Vim_Operato
 enum Vim_Operator_State_Flag {
     VimOpFlag_QueryMotion     = 0x1,
     VimOpFlag_ChangeBehaviour = 0x2,
+    VimOpFlag_DeleteBehaviour = 0x4,
 };
 
 struct Vim_Operator_State {
@@ -2974,11 +2994,16 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
             }
 
             if (state->motion) {
+                if (HasFlag(state->flags, VimOpFlag_DeleteBehaviour)) {
+                    if      (state->motion == vim_motion_inner_scope)        state->motion = vim_motion_inner_scope_delete;
+                    else if (state->motion == vim_motion_inner_paren)        state->motion = vim_motion_inner_paren_delete;
+                }
+
                 if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
                     // Note: Vim's behaviour is a little inconsistent with some motions wnen using the change operator for the sake of intuitiveness.
                     if      (state->motion == vim_motion_word)               state->motion = vim_motion_word_end;
-                    else if (state->motion == vim_motion_inner_scope)        state->motion = vim_motion_inner_scope_leave_inner_line;
-                    else if (state->motion == vim_motion_inner_paren)        state->motion = vim_motion_inner_paren_leave_inner_line;
+                    else if (state->motion == vim_motion_inner_scope)        state->motion = vim_motion_inner_scope_change;
+                    else if (state->motion == vim_motion_inner_paren)        state->motion = vim_motion_inner_paren_change;
                     else if (state->motion == vim_motion_to_empty_line_up)   state->motion = vim_motion_prior_to_empty_line_up;
                     else if (state->motion == vim_motion_to_empty_line_down) state->motion = vim_motion_prior_to_empty_line_down;
                 }
