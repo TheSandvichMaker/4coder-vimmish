@@ -2495,16 +2495,18 @@ internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view
 
 internal void vim_search_once(Application_Links* app, View_ID view, Buffer_ID buffer, Scan_Direction direction, i64 pos, String_Const_u8 query, u32 flags, b32 log_jump, b32 always_jump) {
     Range_i64 range = vim_search_once_internal(app, view, buffer, direction, pos, query, flags);
+    i64 jump_target = pos;
     if (range_size(range) > 0) {
+        jump_target = range.min;
         if (log_jump) {
             vim_log_jump_history(app);
             if (!always_jump) {
-                view_set_cursor_and_preferred_x(app, view, seek_pos(range.min));
+                view_set_cursor_and_preferred_x(app, view, seek_pos(jump_target));
             }
         }
     }
     if (always_jump) {
-        view_set_cursor_and_preferred_x(app, view, seek_pos(range.min));
+        view_set_cursor_and_preferred_x(app, view, seek_pos(jump_target));
     }
 }
 
