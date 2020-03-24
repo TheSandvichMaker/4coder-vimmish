@@ -724,11 +724,6 @@ internal Vim_Key vim_get_key_from_input(User_Input in) {
     return key;
 }
 
-internal b32 vim_keys_match(Vim_Key a, Vim_Key b) {
-    b32 result = (a.kc == b.kc) && (a.mods == b.mods);
-    return result;
-}
-
 internal u64 vim_key_code_hash(Vim_Key key) {
     u64 result = (cast(u64) key.kc) | ((cast(u64) key.mods) << 16); 
     return result;
