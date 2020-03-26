@@ -99,13 +99,14 @@
 // - Create a non-stopgap solution to case sensitive / whole word searches (tab during search query would be better suited to auto complete)
 // - Do stuff with 0-9 registers (or yeet them because... does anybody use these?)
 // - vim_align_range breaks when aligning characters at the end of lines, it seems.
-// - check for finnicky auto indent things (indenting one line more than expected, not indenting preprocessor defines properly)
+// - Check for finnicky auto indent things (indenting one line more than expected, not indenting preprocessor defines properly)
+// - Why does vim_motion_down wrap? Make it stop.
 
 //
 // Internal Defines
 //
 
-#define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // Note: I don't really think this is good for my use, but it's here if you like things that complicate your life
+#define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // NOTE: I don't really think this is good for my use, but it's here if you like things that complicate your life
 #define VIM_PRINT_COMMANDS 0
 
 //
@@ -533,7 +534,7 @@ enum Vim_Motion_Flag {
     VimMotionFlag_AlwaysSeek                = 0x10,
     VimMotionFlag_LogJumpPostSeek           = 0x20,
     VimMotionFlag_IgnoreMotionCount         = 0x40,
-    VimMotionFlag_WordObject                = 0x80,
+    VimMotionFlag_TextObject                = 0x80,
 };
 
 struct Vim_Motion_Result {
@@ -1054,13 +1055,9 @@ internal void vim_macro_end(Application_Links* app, u8 reg_char) {
         vim_state.most_recent_macro_register = reg_char;
 
         Buffer_ID buffer = get_keyboard_log_buffer(app);
-        Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
-        // @Robustness: We step back by two lines because we want to exclude both the key stroke and text insert event.
-        // But this seems kind of dodgy, because it assumes the keyboard macro was ended with a bind that has an
-        // associated text insert event.
-        Buffer_Cursor back_cursor = buffer_compute_cursor(app, buffer, seek_line_col(cursor.line - 2, 1));
 
-        Range_i64 range = Ii64(vim_state.current_macro_start_pos, back_cursor.pos);
+        i64 macro_end_pos = vim_state.command_start_pos;
+        Range_i64 range = Ii64(vim_state.current_macro_start_pos, macro_end_pos);
 
         Scratch_Block scratch(app);
         String_Const_u8 macro_string = push_buffer_range(app, scratch, buffer, range);
@@ -1551,7 +1548,7 @@ internal void vim_seek_motion_result(Application_Links* app, View_ID view, Buffe
         }
     }
 
-    if (HasFlag(result.flags, VimMotionFlag_WordObject)) {
+    if (HasFlag(result.flags, VimMotionFlag_TextObject)) {
         if (HasFlag(result.flags, VimMotionFlag_SetPreferredX)) {
             view_set_cursor_and_preferred_x(app, view, seek_pos(result.range.max));
         } else {
@@ -2073,16 +2070,7 @@ internal VIM_MOTION(vim_motion_scope) {
             if (!token) {
                 break;
             }
-#if 0
-            while (token->kind == TokenBaseKind_Whitespace) {
-                token_it_inc(&it);
-                token = token_it_read(&it);
-            }
 
-            if (!token) {
-                break;
-            }
-#endif
             if (range_contains_inclusive(line_range, token->pos + token->size)) {
                 if (token->kind == TokenBaseKind_ScopeOpen          ||
                     token->kind == TokenBaseKind_ParentheticalOpen  ||
@@ -2172,7 +2160,7 @@ function b32 vim_find_surrounding_nest(Application_Links *app, Buffer_ID buffer,
 internal Vim_Motion_Result vim_motion_inner_nest_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, Find_Nest_Flag flags, b32 leave_inner_line, b32 select_inner_block) {
     // @TODO: Turn this function into not a total hot mess
     Vim_Motion_Result result = vim_null_motion(start_pos);
-    result.flags |= VimMotionFlag_SetPreferredX|VimMotionFlag_WordObject;
+    result.flags |= VimMotionFlag_SetPreferredX|VimMotionFlag_TextObject;
 
     if (vim_find_surrounding_nest(app, buffer, start_pos, flags, &result.range, true)) {
         i64 min = result.range.min;
@@ -3078,7 +3066,6 @@ internal String_Const_u8 vim_cut_range(Application_Links* app, Arena* arena, Vie
     return result;
 }
 
-#if 1
 enum Vim_DCY {
     VimDCY_Delete,
     VimDCY_Change,
@@ -3163,6 +3150,8 @@ internal VIM_OPERATOR(vim_delete) {
 }
 
 internal VIM_OPERATOR(vim_delete_character) {
+    // @TODO: At the end of the line, this will delete the newline rather than step back and delete the last character on the line, contrary to vim's behaviour.
+    //        It's a little annoying, so I want to make sure to get it consistent with him.
     vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
 }
 
@@ -3187,142 +3176,6 @@ internal VIM_OPERATOR(vim_yank_eol) {
     // vim_delete_change_or_yank(app, handler, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
     vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
 }
-
-#else
-
-internal VIM_OPERATOR(vim_delete) {
-    Scratch_Block scratch(app);
-    List_String_Const_u8 list = {};
-
-    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
-    Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
-    String_Const_u8 eol = (*eol_setting == LineEndingKind_CRLF) ? SCu8("\r\n") : SCu8("\n");
-
-    b32 insert_final_newline = false;
-    i64 prev_line = 0;
-
-    Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_delete, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
-        Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
-
-        i64 line = line_range.min;
-        if (prev_line && prev_line != line) {
-            insert_final_newline = true;
-            string_list_push(scratch, &list, eol);
-        }
-
-        String_Const_u8 cut_string = vim_cut_range(app, scratch, view, buffer, range);
-        string_list_push(scratch, &list, cut_string);
-        if (line_range.min != line_range.max) {
-            auto_indent_buffer(app, buffer, Ii64(range.min, range.min + 1));
-        }
-
-        prev_line = line;
-    }
-
-    if (insert_final_newline) {
-        string_list_push(scratch, &list, eol);
-    }
-
-    String_Const_u8 cut_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
-    if (cut_string.size) {
-        b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
-        vim_write_register(app, vim_state.active_register, cut_string, from_block_copy);
-    }
-}
-
-internal VIM_OPERATOR(vim_change) {
-    Scratch_Block scratch(app);
-    List_String_Const_u8 list = {};
-
-    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
-    Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
-    String_Const_u8 eol = (*eol_setting == LineEndingKind_CRLF) ? SCu8("\r\n") : SCu8("\n");
-
-    b32 insert_final_newline = false;
-    i64 prev_line = 0;
-
-    b32 did_act = false;
-    Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_change, VimOpFlag_ChangeBehaviour|VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
-        Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
-
-        did_act = true;
-        i64 line = line_range.min;
-        if (prev_line && prev_line != line) {
-            insert_final_newline = true;
-            string_list_push(scratch, &list, eol);
-        }
-
-        String_Const_u8 cut_string = vim_cut_range(app, scratch, view, buffer, range);
-        string_list_push(scratch, &list, cut_string);
-        if (line_range.min != line_range.max) {
-            auto_indent_line_at_cursor(app);
-        }
-
-        prev_line = line;
-    }
-
-    if (insert_final_newline) {
-        string_list_push(scratch, &list, eol);
-    }
-
-    String_Const_u8 cut_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
-    if (cut_string.size) {
-        b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
-        vim_write_register(app, vim_state.active_register, cut_string, from_block_copy);
-    }
-
-    if (did_act) {
-        if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
-            History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
-            Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
-            vim_buffer->history_index_post_change = current_history_index;
-            vim_enter_visual_insert_mode(app);
-        } else {
-            vim_enter_insert_mode(app);
-        }
-    }
-}
-
-internal VIM_OPERATOR(vim_yank) {
-    Scratch_Block scratch(app);
-    List_String_Const_u8 list = {};
-
-    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
-    Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
-    String_Const_u8 eol = (*eol_setting == LineEndingKind_CRLF) ? SCu8("\r\n") : SCu8("\n");
-
-    b32 insert_final_newline = false;
-    i64 prev_line = 0;
-
-    Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_yank, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
-        i64 line = get_line_number_from_pos(app, buffer, range.min);
-        if (prev_line && prev_line != line) {
-            insert_final_newline = true;
-            string_list_push(scratch, &list, eol);
-        }
-        prev_line = line;
-        String_Const_u8 string = push_buffer_range(app, scratch, buffer, range);
-        string_list_push(scratch, &list, string);
-    }
-
-    if (insert_final_newline) {
-        string_list_push(scratch, &list, eol);
-    }
-
-    String_Const_u8 final_string = string_list_flatten(scratch, list, StringFill_NoTerminate);
-    if (final_string.size) {
-        b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
-        vim_write_register(app, vim_state.active_register, final_string, from_block_copy);
-        vim_write_register(app, vim_get_register('0'), final_string, from_block_copy);
-    }
-}
-#endif
 
 internal VIM_OPERATOR(vim_replace) {
     String_Const_u8 replace_char = vim_get_next_writable(app);
@@ -4270,11 +4123,14 @@ function void vim_draw_cursor(Application_Links *app, View_ID view, b32 is_activ
         if (is_vim_insert_mode(mode)) {
             draw_character_i_bar(app, text_layout_id, cursor_pos, fcolor_id(cursor_color, cursor_sub_id));
         } else {
+            Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
             Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
 
             if (selection.kind) {
                 Range_i64 range = {};
                 while (vim_selection_consume_line(app, buffer, &selection, &range, true)) {
+                    // @TODO: Even if I limit the drawing to the visible range, this slows 4coder to a crawl if you select a big amount of text...
+                    range = range_intersect(range, visible_range);
                     vim_draw_character_block_selection(app, buffer, text_layout_id, range, roundness, fcolor_id(defcolor_highlight));
                     paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
                 }
@@ -5144,7 +5000,10 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         vim_bind_generic_command(&vim_map_normal, q,                                          vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_Q));
         vim_bind_generic_command(&vim_map_normal, qa,                                         vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_Q, KeyCode_Shift));
         vim_bind_generic_command(&vim_map_normal, save,                                       vim_leader, vim_key(KeyCode_F), vim_key(KeyCode_W));
-
+        
+        vim_named_bind(&vim_map_normal, string_u8_litexpr("Search"), vim_leader, vim_key(KeyCode_S));
+        vim_bind_generic_command(&vim_map_normal, list_all_substring_locations_case_insensitive, vim_leader, vim_key(KeyCode_S), vim_key(KeyCode_S));
+        
         // vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_no_indent_style,           vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
         vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_range_indent_style,        vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
         // vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_full_indent_style,         vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
