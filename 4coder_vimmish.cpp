@@ -100,6 +100,7 @@
 // - Do stuff with 0-9 registers (or yeet them because... does anybody use these?)
 // - vim_align_range breaks when aligning characters at the end of lines, it seems.
 // - check for finnicky auto indent things (indenting one line more than expected, not indenting preprocessor defines properly)
+// - make the miblo number things handle negative numbers
 
 //
 // Internal Defines
@@ -1597,7 +1598,6 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
         vim_state.command_start_pos = back_cursor.pos;
     }
 
-    vim_state.character_seek_show_highlight = false;
     vim_state.capture_queries_into_chord_bar = true;
 
     i64 queried_number = vim_query_number(app, VimQuery_CurrentInput);
@@ -1631,6 +1631,7 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
 
         switch (bind->kind) {
             case VimBindingKind_Motion: {
+                vim_state.character_seek_show_highlight = false;
                 i64 old_pos = view_get_cursor_pos(app, view);
                 Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, bind->motion, old_pos, op_count, op_count_was_set);
                 vim_seek_motion_result(app, view, buffer, mr);
@@ -2782,6 +2783,7 @@ CUSTOM_COMMAND_SIG(vim_reverse_isearch_word_under_cursor) {
 // @TODO: gd, search for the first occurence in the scope, walking up scopes until a match is found.
 
 CUSTOM_COMMAND_SIG(noh) {
+    vim_state.character_seek_show_highlight = false;
     vim_state.search_show_highlight = false;
 }
 
@@ -3443,6 +3445,7 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
                 buffer_replace_range(app, buffer, replace_range, line_string);
 
                 ARGB_Color argb = fcolor_resolve(fcolor_id(defcolor_paste));
+                // @TODO: Figure out why these fades end up wrong sometimes
                 buffer_post_fade(app, buffer, 0.667f, Ii64_size(replace_range.min, paste_string.size), argb);
             }
             String_Const_u8 replaced_string = string_list_flatten(scratch, replaced_string_list, StringFill_NoTerminate);
@@ -3485,6 +3488,7 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
             }
 
             ARGB_Color argb = fcolor_resolve(fcolor_id(defcolor_paste));
+            // @TODO: Figure out why these fades end up wrong sometimes
             buffer_post_fade(app, buffer, 0.667f, Ii64_size(view_get_cursor_pos(app, view), paste_string.size), argb);
         }
 
@@ -3692,7 +3696,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
 
 internal void vim_align_internal(Application_Links* app, Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
     if (selection.kind == VimSelectionKind_Block || selection.kind == VimSelectionKind_Line) {
-        String_Const_u8 align_target = vim_get_next_writable(app);
+           String_Const_u8 align_target = vim_get_next_writable(app);
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
         Range_i64 col_range  = Ii64(selection.range.first.col , selection.range.one_past_last.col );
         for (i32 i = 0; i < count; i++) {
@@ -4826,9 +4830,11 @@ function void vim_set_default_colors(Application_Links *app) {
     active_color_table.arrays[defcolor_vim_bar_normal] = make_colors(arena, 0xFF888888);
     active_color_table.arrays[defcolor_vim_bar_insert] = make_colors(arena, 0xFF888888);
     active_color_table.arrays[defcolor_vim_bar_visual] = make_colors(arena, 0xFF888888);
+    active_color_table.arrays[defcolor_vim_bar_recording_macro] = make_colors(arena, 0xFF888888);
     active_color_table.arrays[defcolor_vim_cursor_normal] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
     active_color_table.arrays[defcolor_vim_cursor_insert] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
     active_color_table.arrays[defcolor_vim_cursor_visual] = make_colors(arena, 0xFF00EE00, 0xFFEE7700);
+    active_color_table.arrays[defcolor_vim_character_highlight] = make_colors(arena, 0xFFEE7700);
 }
 
 //
@@ -4885,27 +4891,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         BindMouseRelease(click_set_cursor, MouseCode_Left);
         BindCore(click_set_cursor_and_mark, CoreCode_ClickActivateView);
         BindMouseMove(click_set_cursor_if_lbutton);
-        Bind(center_view,                                   KeyCode_E, KeyCode_Control);
-        Bind(left_adjust_view,                              KeyCode_E, KeyCode_Control, KeyCode_Shift);
-        Bind(search,                                        KeyCode_F, KeyCode_Control);
-        Bind(list_all_locations,                            KeyCode_F, KeyCode_Control, KeyCode_Shift);
-        Bind(list_all_substring_locations_case_insensitive, KeyCode_F, KeyCode_Alt);
-        Bind(list_all_locations_of_selection,               KeyCode_G, KeyCode_Control, KeyCode_Shift);
-        Bind(snippet_lister,                                KeyCode_J, KeyCode_Control);
-        Bind(kill_buffer,                                   KeyCode_K, KeyCode_Control, KeyCode_Shift);
-        Bind(duplicate_line,                                KeyCode_L, KeyCode_Control);
-        Bind(cursor_mark_swap,                              KeyCode_M, KeyCode_Control);
-        Bind(reopen,                                        KeyCode_O, KeyCode_Control, KeyCode_Shift);
-        Bind(query_replace,                                 KeyCode_Q, KeyCode_Control);
-        Bind(query_replace_identifier,                      KeyCode_Q, KeyCode_Control, KeyCode_Shift);
-        Bind(query_replace_selection,                       KeyCode_Q, KeyCode_Alt);
-        Bind(reverse_search,                                KeyCode_R, KeyCode_Control);
-        Bind(save,                                          KeyCode_S, KeyCode_Control);
-        Bind(save_all_dirty_buffers,                        KeyCode_S, KeyCode_Control, KeyCode_Shift);
-        Bind(search_identifier,                             KeyCode_T, KeyCode_Control);
-        Bind(list_all_locations_of_identifier,              KeyCode_T, KeyCode_Control, KeyCode_Shift);
-        Bind(view_buffer_other_panel,                       KeyCode_1, KeyCode_Control);
-        Bind(swap_panels,                                   KeyCode_2, KeyCode_Control);
     }
 
     SelectMap(mapid_file);
@@ -4935,7 +4920,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         Bind(snipe_backward_whitespace_or_token_boundary, KeyCode_Backspace, KeyCode_Alt);
         Bind(snipe_forward_whitespace_or_token_boundary,  KeyCode_Delete, KeyCode_Alt);
         Bind(set_mark,                                    KeyCode_Space, KeyCode_Control);
-        Bind(replace_in_range,                            KeyCode_A, KeyCode_Control);
         Bind(copy,                                        KeyCode_C, KeyCode_Control);
         Bind(delete_range,                                KeyCode_D, KeyCode_Control);
         Bind(delete_line,                                 KeyCode_D, KeyCode_Control, KeyCode_Shift);
@@ -5005,8 +4989,8 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         vim_bind_motion(&vim_map_operator_pending, vim_motion_up,                             vim_key(KeyCode_Up));
         vim_bind_motion(&vim_map_operator_pending, vim_motion_right,                          vim_key(KeyCode_Right));
 
-        vim_bind_motion(&vim_map_operator_pending, vim_motion_to_empty_line_down,             vim_key(KeyCode_LeftBracket, KeyCode_Shift));
-        vim_bind_motion(&vim_map_operator_pending, vim_motion_to_empty_line_up,               vim_key(KeyCode_RightBracket, KeyCode_Shift));
+        vim_bind_motion(&vim_map_operator_pending, vim_motion_to_empty_line_down,             vim_key(KeyCode_RightBracket, KeyCode_Shift));
+        vim_bind_motion(&vim_map_operator_pending, vim_motion_to_empty_line_up,               vim_key(KeyCode_LeftBracket, KeyCode_Shift));
 
         vim_bind_motion(&vim_map_operator_pending, vim_motion_word,                           vim_key(KeyCode_W));
         vim_bind_motion(&vim_map_operator_pending, vim_motion_big_word,                       vim_key(KeyCode_W, KeyCode_Shift));
