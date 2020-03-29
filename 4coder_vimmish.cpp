@@ -108,6 +108,7 @@
 // - Make the miblo number things handle negative numbers
 // - Clamp left / right motions to line
 // - Disallow sitting on the newline
+// - Turns out, jump history is hella broken. Investigate!!!
 
 //
 // Internal Defines
@@ -304,14 +305,27 @@ struct Vim_Global_State {
     Heap                 heap;
     Base_Allocator       alloc;
 
-    Vim_Register         registers[36];        // "a-z + "0-9
-    Vim_Register         unnamed_register;     // ""
-    Vim_Register         clipboard_register;   // "+ (and "* for now)
-    Vim_Register         last_search_register; // "/
-    Vim_Register         command_register;     // for command repetition - not exposed to the user
+    union {
+        Vim_Register alphanumeric_registers[26 + 10];
+        struct {
+            Vim_Register alpha_registers[26];   // "a-"z
+            Vim_Register numeric_registers[10]; // "0-"9
+        };
+    };
+
+    Vim_Register         unnamed_register;      // ""
+    Vim_Register         clipboard_register;    // "+ (and "* for now)
+    Vim_Register         last_search_register;  // "/
+    Vim_Register         command_register;      // for command repetition - not exposed to the user
     Vim_Register*        active_register;
 
-    Tiny_Jump            marks[36]; // a-Z
+    union {
+        Tiny_Jump all_marks[26 + 26];        
+        struct {
+            Tiny_Jump lower_marks[26]; // 'a-'z
+            Tiny_Jump upper_marks[26]; // 'A-'Z
+        };
+    };
 
     u8                   most_recent_macro_register;
     b32                  recording_macro;
@@ -326,6 +340,8 @@ struct Vim_Global_State {
     i64                  command_start_pos;
     History_Group        command_history;
     Vim_Visual_Selection command_selection;
+
+    u16                  most_recent_input_modifiers;
 
     b32                  search_show_highlight;
     u32                  search_flags;
@@ -356,12 +372,12 @@ internal Vim_Register* vim_get_register(u8 register_char) {
 
     b32 append = false;
     if (character_is_lower(register_char)) {
-        result = vim_state.registers + (register_char - 'a');
+        result = vim_state.alpha_registers + (register_char - 'a');
     } else if (character_is_upper(register_char)) {
-        result = vim_state.registers + (register_char - 'A');
+        result = vim_state.alpha_registers + (register_char - 'A');
         append = true;
     } else if (register_char >= '0' && register_char <= '9') {
-        result = vim_state.registers + 26 + (register_char - '0');
+        result = vim_state.numeric_registers + (register_char - '0');
     } else if (register_char == '*' || register_char == '+') {
         // @TODO: I don't know if on Linux it's worth it to make a distinction between "* and "+
         result = &vim_state.clipboard_register;
@@ -456,27 +472,40 @@ struct Vim_View_Attachment {
     Tiny_Jump jump_history[VIM_JUMP_HISTORY_SIZE];
 };
 
+internal void vim_delete_jump_history_at_index(Application_Links* app, Vim_View_Attachment* vim_view, i32 jump_index) {
+    if (jump_index >= vim_view->jump_history_min && jump_index < vim_view->jump_history_one_past_max) {
+        i32 jumps_left = vim_view->jump_history_one_past_max - jump_index;
+
+        vim_view->jump_history_one_past_max--;
+        vim_view->jump_history_cursor = Min(vim_view->jump_history_cursor, vim_view->jump_history_one_past_max);
+
+        if (jumps_left > 1) {
+            // @Speed
+            for (i32 shift = 0; shift < jumps_left - 1; shift++) {
+                i32 shift_index = jump_index + shift;
+                vim_view->jump_history[shift_index % ArrayCount(vim_view->jump_history)] = vim_view->jump_history[(shift_index + 1) % ArrayCount(vim_view->jump_history)];
+            }
+        }
+    }
+}
+
+internal void vim_delete_jump_history_at_index(Application_Links* app, i32 jump_index) {
+    View_ID view = get_active_view(app, Access_Always);
+    Managed_Scope scope = view_get_managed_scope(app, view);
+    Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
+    vim_delete_jump_history_at_index(app, vim_view, jump_index);
+}
+
 internal void vim_log_jump_history_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_View_Attachment* vim_view, i64 pos) {
     i64 line = get_line_number_from_pos(app, buffer, pos);
 
     Scratch_Block scratch(app);
     for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
-        i32 jumps_left = vim_view->jump_history_one_past_max - jump_index;
         Tiny_Jump test_jump = vim_view->jump_history[jump_index % ArrayCount(vim_view->jump_history)];
         if (test_jump.buffer == buffer) {
             i64 test_line = get_line_number_from_pos(app, buffer, test_jump.pos); // @Speed
             if (test_line == line) {
-                vim_view->jump_history_one_past_max--;
-                vim_view->jump_history_cursor = Min(vim_view->jump_history_cursor, vim_view->jump_history_one_past_max);
-
-                if (jumps_left > 1) {
-                    // @Speed
-                    for (i32 shift = 0; shift < jumps_left - 1; shift++) {
-                        i32 shift_index = jump_index + shift;
-                        vim_view->jump_history[shift_index % ArrayCount(vim_view->jump_history)] = vim_view->jump_history[(shift_index + 1) % ArrayCount(vim_view->jump_history)];
-                    }
-                }
-
+                vim_delete_jump_history_at_index(app, vim_view, jump_index);
                 break;
             }
         }
@@ -509,12 +538,13 @@ CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
     Managed_Scope scope = view_get_managed_scope(app, view);
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
-    b32 log_jump = false;
+#if 0
+    // NOTE: vim doesn't do this, but I feel like it's nice behaviour
     if (vim_view->jump_history_cursor == vim_view->jump_history_one_past_max) {
-        log_jump = true;
         vim_log_jump_history(app);
         vim_view->jump_history_cursor--;
     }
+#endif
 
     if (vim_view->jump_history_cursor > vim_view->jump_history_min) {
         Tiny_Jump jump = vim_view->jump_history[(--vim_view->jump_history_cursor) % ArrayCount(vim_view->jump_history)];
@@ -595,6 +625,22 @@ struct Vim_Key {
     u16 mods;
     u32 codepoint;
 };
+
+internal u64 vim_key_code_hash(Vim_Key key) {
+    u64 result = 0;
+    if (key.kc) {
+        result = (cast(u64) key.kc) | ((cast(u64) key.mods) << 16);
+    }
+    return result;
+}
+
+internal u64 vim_codepoint_hash(Vim_Key key) {
+    u64 result = 0;
+    if (key.codepoint) {
+        result = ((cast(u64) key.codepoint) << 32) | ((cast(u64) key.mods) << 16);
+    }
+    return result;
+}
 
 struct Vim_Key_Sequence {
     i32 count;
@@ -681,9 +727,30 @@ internal Vim_Key vim_key(
     return result;
 }
 
-internal Vim_Key vim_char(u32 codepoint) {
+internal Vim_Key vim_char(
+    u32 codepoint,
+    Key_Code mod1 = 0,
+    Key_Code mod2 = 0,
+    Key_Code mod3 = 0,
+    Key_Code mod4 = 0,
+    Key_Code mod5 = 0,
+    Key_Code mod6 = 0,
+    Key_Code mod7 = 0,
+    Key_Code mod8 = 0
+) {
+    Input_Modifier_Set_Fixed mods = {};
+    if (mod1) { Assert(mod1 != KeyCode_Shift); mods.mods[mods.count++] = mod1; }
+    if (mod2) { Assert(mod2 != KeyCode_Shift); mods.mods[mods.count++] = mod2; }
+    if (mod3) { Assert(mod3 != KeyCode_Shift); mods.mods[mods.count++] = mod3; }
+    if (mod4) { Assert(mod4 != KeyCode_Shift); mods.mods[mods.count++] = mod4; }
+    if (mod5) { Assert(mod5 != KeyCode_Shift); mods.mods[mods.count++] = mod5; }
+    if (mod6) { Assert(mod6 != KeyCode_Shift); mods.mods[mods.count++] = mod6; }
+    if (mod7) { Assert(mod7 != KeyCode_Shift); mods.mods[mods.count++] = mod7; }
+    if (mod8) { Assert(mod8 != KeyCode_Shift); mods.mods[mods.count++] = mod8; }
+
     Vim_Key result = {};
     result.codepoint = codepoint;
+    result.mods = input_modifier_set_fixed_to_vim_modifiers(mods);
     return result;
 }
 
@@ -721,16 +788,6 @@ internal Vim_Key vim_get_key_from_input(User_Input in) {
         }
     }
     return key;
-}
-
-internal u64 vim_key_code_hash(Vim_Key key) {
-    u64 result = (cast(u64) key.kc) | ((cast(u64) key.mods) << 16);
-    return result;
-}
-
-internal u64 vim_codepoint_hash(Vim_Key key) {
-    u64 result = (cast(u64) key.codepoint) << 32;
-    return result;
 }
 
 enum Vim_Binding_Kind {
@@ -1019,6 +1076,7 @@ internal void vim_print_bind(Application_Links* app, Vim_Key_Binding* bind) {
 
 internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Handler* handler, Vim_Binding_Handler* fallback, VimQueryMode mode) {
     Vim_Key key = vim_get_key_from_input_query(app, mode);
+
     Vim_Key_Binding* bind = make_or_retrieve_vim_binding(handler, &handler->keybind_table, key, false);
     Vim_Key_Binding* fallback_bind = 0;
     if (fallback) {
@@ -1061,7 +1119,7 @@ internal void vim_macro_begin(Application_Links* app, u8 reg_char) {
     }
 
     Vim_Register* reg = vim_get_register(reg_char);
-    b32 reg_is_alphanumeric = (reg >= vim_state.registers) && (reg < vim_state.registers + ArrayCount(vim_state.registers));
+    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) && (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
     if (reg && reg_is_alphanumeric) {
         vim_state.recording_macro = true;
         vim_state.most_recent_macro_register = reg_char;
@@ -1078,7 +1136,7 @@ internal void vim_macro_end(Application_Links* app, u8 reg_char) {
     }
 
     Vim_Register* reg = vim_get_register(reg_char);
-    b32 reg_is_alphanumeric = (reg >= vim_state.registers) && (reg < vim_state.registers + ArrayCount(vim_state.registers));
+    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) && (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
     if (reg && reg_is_alphanumeric) {
         vim_state.recording_macro = false;
         vim_state.most_recent_macro_register = reg_char;
@@ -1150,9 +1208,9 @@ CUSTOM_COMMAND_SIG(vim_set_mark) {
         u8 mark_char = str.str[0];
         Tiny_Jump* mark = 0;
         if (character_is_lower(mark_char)) {
-            mark = vim_state.marks + (mark_char - 'a');
+            mark = vim_state.lower_marks + (mark_char - 'a');
         } else if (character_is_upper(mark_char)) {
-            mark = vim_state.marks + (mark_char - 'A');
+            mark = vim_state.upper_marks + (mark_char - 'A');
         }
         if (mark) {
             mark->buffer = buffer;
@@ -1161,7 +1219,7 @@ CUSTOM_COMMAND_SIG(vim_set_mark) {
     }
 }
 
-CUSTOM_COMMAND_SIG(vim_go_to_mark) {
+internal void vim_go_to_mark_internal(Application_Links* app, b32 reduced_jump_history) {
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
@@ -1171,15 +1229,30 @@ CUSTOM_COMMAND_SIG(vim_go_to_mark) {
     if (str.size) {
         u8 mark_char = str.str[0];
         Tiny_Jump* mark = 0;
+        b32 upper_mark = false;
         if (character_is_lower(mark_char)) {
-            mark = vim_state.marks + (mark_char - 'a');
+            mark = vim_state.lower_marks + (mark_char - 'a');
         } else if (character_is_upper(mark_char)) {
-            mark = vim_state.marks + (mark_char - 'A');
+            upper_mark = true;
+            mark = vim_state.upper_marks + (mark_char - 'A');
         }
         if (mark) {
-            jump_to_location(app, view, mark->buffer, mark->pos);
+            if (upper_mark || mark->buffer == buffer) {
+                if (!reduced_jump_history || mark->buffer == buffer) {
+                    vim_log_jump_history(app);
+                }
+                jump_to_location(app, view, mark->buffer, mark->pos);
+            }
         }
     }
+}
+
+CUSTOM_COMMAND_SIG(vim_go_to_mark) {
+    vim_go_to_mark_internal(app, false);
+}
+
+CUSTOM_COMMAND_SIG(vim_go_to_mark_less_history) {
+    vim_go_to_mark_internal(app, true);
 }
 
 internal void vim_command_begin(Application_Links* app, Buffer_ID buffer, u32 flags) {
@@ -1669,7 +1742,7 @@ internal Vim_Binding_Handler* vim_get_handler_for_mode(Vim_Mode mode) {
 
 internal void vim_select_range(Application_Links* app, View_ID view, Range_i64 range) {
     view_set_mark(app, view, seek_pos(range.min));
-    view_set_cursor(app, view, seek_pos(range.max - 1));
+    view_set_cursor(app, view, seek_pos(range.max - 1)); // @Unicode
 }
 
 CUSTOM_COMMAND_SIG(vim_handle_input) {
@@ -4697,6 +4770,15 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
         Vim_Key_Binding* vim_bind = 0;
         if (handler && handler->initialized) {
             Vim_Key vim_key = vim_get_key_from_input(input);
+            if (input.event.kind == InputEventKind_KeyStroke) {
+                if (vim_key.mods) {
+                    vim_state.most_recent_input_modifiers = vim_key.mods;
+                } else {
+                    vim_state.most_recent_input_modifiers = key_code_to_vim_modifier(vim_key.kc);
+                }
+            } else if (input.event.kind == InputEventKind_TextInsert) {
+                vim_key.mods = vim_state.most_recent_input_modifiers;
+            }
             vim_bind = make_or_retrieve_vim_binding(handler, &handler->keybind_table, vim_key, false);
         }
 
@@ -4756,11 +4838,52 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
     }
 }
 
+BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
+    default_buffer_edit_range(app, buffer_id, new_range, original_size);
+    
+    Range_i64 old_range = Ii64(new_range.first, new_range.first + original_size);
+    // Range_i64 old_line_range = get_line_range_from_pos_range(app, buffer_id, old_range);
+
+    i64 insert_size = range_size(new_range);
+    i64 text_shift = replace_range_shift(old_range, insert_size);
+
+    for (u32 mark_index = 0; mark_index < ArrayCount(vim_state.all_marks); mark_index++) {
+        Tiny_Jump* mark = vim_state.all_marks + mark_index;
+        if (mark->buffer == buffer_id) {
+            // NOTE: I'm not bothering to delete lower case marks if you delete the line they're on, like happens in vim,
+            //       because that behaviour seems totally pointless AND WHY IS IT ONLY FOR LOWER CASE MARKS? Vim's weird, dude.
+            if (new_range.min < mark->pos) {
+                mark->pos += text_shift;
+            }
+        }
+    }
+
+    for (View_ID view = get_view_next(app, 0, Access_Read); view; view = get_view_next(app, view, Access_Read)) {
+        Managed_Scope scope = view_get_managed_scope(app, view);
+        Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
+        for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
+            Tiny_Jump* jump = vim_view->jump_history + (jump_index % ArrayCount(vim_view->jump_history));
+            if (jump->buffer == buffer_id) {
+                // @TODO: Make it look at the line instead
+                // i64 line = get_line_number_from_pos(app, buffer_id, jump->pos);
+                // if (text_shift < 0 && range_contains(old_line_range, line)) {
+                if (text_shift < 0 && range_contains(old_range, jump->pos)) {
+                    vim_delete_jump_history_at_index(app, vim_view, jump_index);
+                } else if (new_range.min < jump->pos) {
+                    jump->pos += text_shift;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 function void vim_set_default_colors(Application_Links *app) {
     // NOTE: If this assert fires, you haven't called set_default_color_scheme() yet.
     Assert(global_theme_arena.base_allocator);
 
-    Arena *arena = &global_theme_arena;
+    Arena* arena = &global_theme_arena;
 
     active_color_table.arrays[defcolor_vim_bar_normal] = make_colors(arena, 0xFF888888);
     active_color_table.arrays[defcolor_vim_bar_insert] = make_colors(arena, 0xFF888888);
@@ -5054,6 +5177,9 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
 
         vim_bind_generic_command(&vim_map_normal, vim_set_mark,                               vim_char('m'));
         vim_bind_generic_command(&vim_map_normal, vim_go_to_mark,                             vim_char('\''));
+        vim_bind_generic_command(&vim_map_normal, vim_go_to_mark,                             vim_char('`'));
+        vim_bind_generic_command(&vim_map_normal, vim_go_to_mark_less_history,                vim_char('g'), vim_char('\''));
+        vim_bind_generic_command(&vim_map_normal, vim_go_to_mark_less_history,                vim_char('g'), vim_char('`'));
 
         vim_bind_generic_command(&vim_map_normal, vim_open_file_in_quotes_in_same_window,     vim_key(KeyCode_G), vim_key(KeyCode_F));
         vim_bind_generic_command(&vim_map_normal, vim_jump_to_definition_under_cursor,        vim_key(KeyCode_RightBracket, KeyCode_Control));
@@ -5148,6 +5274,7 @@ internal void vim_set_default_hooks(Application_Links* app) {
     set_custom_hook(app, HookID_RenderCaller, vim_render_caller);
     set_custom_hook(app, HookID_BeginBuffer, vim_begin_buffer);
     set_custom_hook(app, HookID_Tick, vim_tick);
+    set_custom_hook(app, HookID_BufferEditRange, vim_default_buffer_edit_range);
 }
 
 #undef cast
