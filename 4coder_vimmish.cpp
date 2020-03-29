@@ -311,6 +311,8 @@ struct Vim_Global_State {
     Vim_Register         command_register;     // for command repetition - not exposed to the user
     Vim_Register*        active_register;
 
+    Tiny_Jump            marks[36]; // a-Z
+
     u8                   most_recent_macro_register;
     b32                  recording_macro;
     b32                  played_macro;
@@ -1137,6 +1139,49 @@ CUSTOM_COMMAND_SIG(vim_replay_macro) {
     }
 }
 
+CUSTOM_COMMAND_SIG(vim_set_mark) {
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) return;
+
+    String_Const_u8 str = vim_get_next_writable(app);
+    if (str.size) {
+        u8 mark_char = str.str[0];
+        Tiny_Jump* mark = 0;
+        if (character_is_lower(mark_char)) {
+            mark = vim_state.marks + (mark_char - 'a');
+        } else if (character_is_upper(mark_char)) {
+            mark = vim_state.marks + (mark_char - 'A');
+        }
+        if (mark) {
+            mark->buffer = buffer;
+            mark->pos = view_get_cursor_pos(app, view);
+        }
+    }
+}
+
+CUSTOM_COMMAND_SIG(vim_go_to_mark) {
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    if (!buffer_exists(app, buffer)) return;
+
+    String_Const_u8 str = vim_get_next_writable(app);
+    if (str.size) {
+        u8 mark_char = str.str[0];
+        Tiny_Jump* mark = 0;
+        if (character_is_lower(mark_char)) {
+            mark = vim_state.marks + (mark_char - 'a');
+        } else if (character_is_upper(mark_char)) {
+            mark = vim_state.marks + (mark_char - 'A');
+        }
+        if (mark) {
+            jump_to_location(app, view, mark->buffer, mark->pos);
+        }
+    }
+}
+
 internal void vim_command_begin(Application_Links* app, Buffer_ID buffer, u32 flags) {
     if (vim_state.recording_command) {
         return;
@@ -1275,9 +1320,6 @@ CUSTOM_COMMAND_SIG(vim_move_right_on_textual_line) {
     if (pos < line_end_pos) {
         move_right(app);
     }
-}
-
-internal void vim_apply_undo_history_to_line(Application_Links* app, Buffer_ID buffer, Vim_Buffer_Attachment* vim_buffer, i64 line, i64 col_delta, History_Record_Index history_index, Record_Info record, Buffer_Cursor record_cursor) {
 }
 
 internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append = false) {
@@ -5009,6 +5051,9 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         vim_bind_generic_command(&vim_map_normal, vim_step_back_jump_history,                 vim_key(KeyCode_O, KeyCode_Control));
         vim_bind_generic_command(&vim_map_normal, vim_step_forward_jump_history,              vim_key(KeyCode_I, KeyCode_Control));
         vim_bind_generic_command(&vim_map_normal, vim_previous_buffer,                        vim_key(KeyCode_6, KeyCode_Control));
+
+        vim_bind_generic_command(&vim_map_normal, vim_set_mark,                               vim_char('m'));
+        vim_bind_generic_command(&vim_map_normal, vim_go_to_mark,                             vim_char('\''));
 
         vim_bind_generic_command(&vim_map_normal, vim_open_file_in_quotes_in_same_window,     vim_key(KeyCode_G), vim_key(KeyCode_F));
         vim_bind_generic_command(&vim_map_normal, vim_jump_to_definition_under_cursor,        vim_key(KeyCode_RightBracket, KeyCode_Control));
