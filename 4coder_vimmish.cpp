@@ -5285,40 +5285,33 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
         VimBind(&vim_map_normal, save,                                                vim_leader, vim_char('f'), vim_char('w'));
         
         vim_named_bind(&vim_map_normal, string_u8_litexpr("Search"), vim_leader, vim_key(KeyCode_S));
-        VimBind(&vim_map_normal, list_all_substring_locations_case_insensitive, vim_leader, vim_key(KeyCode_S), vim_key(KeyCode_S));
+        VimBind(&vim_map_normal, list_all_substring_locations_case_insensitive,       vim_leader, vim_char('S'), vim_char('S'));
         
-        // vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_no_indent_style,           vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
-        VimBind(&vim_map_normal, vim_toggle_line_comment_range_indent_style,        vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
-        // vim_bind_operator(&vim_map_normal, vim_toggle_line_comment_full_indent_style,         vim_leader, vim_key(KeyCode_C), vim_key(KeyCode_Space));
+        VimBind(&vim_map_normal, vim_toggle_line_comment_range_indent_style,          vim_leader, vim_char('c'), vim_key(KeyCode_Space));
+        VimBind(&vim_map_normal, noh,                                                 vim_leader, vim_char('n'));
 
-        VimBind(&vim_map_normal, noh,                                        vim_leader, vim_key(KeyCode_N));
+        VimBind(&vim_map_normal, vim_isearch_repeat_select_forward,                   vim_char('g'), vim_char('n'));
+        VimBind(&vim_map_normal, vim_isearch_repeat_select_backward,                  vim_char('g'), vim_char('N'));
 
-        VimBind(&vim_map_normal, vim_isearch_repeat_select_forward,          vim_key(KeyCode_G), vim_key(KeyCode_N));
-        VimBind(&vim_map_normal, vim_isearch_repeat_select_backward,         vim_key(KeyCode_G), vim_key(KeyCode_N, KeyCode_Shift));
+        VimBind(&vim_map_normal, vim_enter_normal_mode,                               vim_key(KeyCode_Escape));
+        VimBind(&vim_map_normal, vim_isearch_word_under_cursor,                       vim_char('*'));
+        VimBind(&vim_map_normal, vim_reverse_isearch_word_under_cursor,               vim_char('#'));
+        VimBind(&vim_map_normal, vim_repeat_most_recent_command,                      vim_char('.'));
+        VimBind(&vim_map_normal, vim_move_line_up,                                    vim_char('k', KeyCode_Alt));
+        VimBind(&vim_map_normal, vim_move_line_down,                                  vim_char('j', KeyCode_Alt));
+        VimBind(&vim_map_normal, vim_isearch,                                         vim_char('/'));
+        VimBind(&vim_map_normal, vim_isearch_backward,                                vim_char('?'));
+        VimBind(&vim_map_normal, vim_isearch_repeat_forward,                          vim_char('n'));
+        VimBind(&vim_map_normal, vim_isearch_repeat_backward,                         vim_char('N'));
+        VimBind(&vim_map_normal, goto_next_jump,                                      vim_char('n', KeyCode_Control));
+        VimBind(&vim_map_normal, goto_prev_jump,                                      vim_char('p', KeyCode_Control));
+        VimBind(&vim_map_normal, vim_undo,                                            vim_char('u'));
+        VimBind(&vim_map_normal, vim_redo,                                            vim_char('r', KeyCode_Control));
+        VimBind(&vim_map_normal, command_lister,                                      vim_char(':'));
+        VimBind(&vim_map_normal, if_read_only_goto_position,                          vim_key(KeyCode_Return));
+        VimBind(&vim_map_normal, if_read_only_goto_position_same_panel,               vim_key(KeyCode_Return, KeyCode_Shift));
 
         // vim_bind_fcoder_command(&vim_map_normal, vim_enter_normal_mode, vim_key(KeyCode_Escape));
-
-        //
-        //
-        //
-
-        Bind(vim_enter_normal_mode,                 KeyCode_Escape);
-        Bind(vim_isearch_word_under_cursor,         KeyCode_8, KeyCode_Shift);
-        Bind(vim_reverse_isearch_word_under_cursor, KeyCode_3, KeyCode_Shift);
-        Bind(vim_repeat_most_recent_command,        KeyCode_Period);
-        Bind(vim_move_line_up,                      KeyCode_K, KeyCode_Alt);
-        Bind(vim_move_line_down,                    KeyCode_J, KeyCode_Alt);
-        Bind(vim_isearch,                           KeyCode_ForwardSlash);
-        Bind(vim_isearch_backward,                  KeyCode_ForwardSlash, KeyCode_Shift);
-        Bind(vim_isearch_repeat_forward,            KeyCode_N);
-        Bind(vim_isearch_repeat_backward,           KeyCode_N, KeyCode_Shift);
-        Bind(goto_next_jump,                        KeyCode_N, KeyCode_Control);
-        Bind(goto_prev_jump,                        KeyCode_P, KeyCode_Control);
-        Bind(vim_undo,                              KeyCode_U);
-        Bind(vim_redo,                              KeyCode_R, KeyCode_Control);
-        Bind(command_lister,                        KeyCode_Semicolon, KeyCode_Shift);
-        Bind(if_read_only_goto_position,            KeyCode_Return);
-        Bind(if_read_only_goto_position_same_panel, KeyCode_Return, KeyCode_Shift);
     }
 
     SelectMap(vim_mapid_visual);
