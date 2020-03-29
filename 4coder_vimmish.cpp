@@ -610,7 +610,7 @@ typedef VIM_MOTION(Vim_Motion);
 #define VIM_TEXT_OBJECT(name) Vim_Text_Object_Result name(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, i32 motion_count, b32 motion_count_was_set)
 typedef VIM_TEXT_OBJECT(Vim_Text_Object);
 
-#define VIM_OPERATOR(name) void name(Application_Links* app, struct Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 count_was_set)
+#define VIM_OPERATOR(name) void name(Application_Links* app, struct Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 count_was_set)
 typedef VIM_OPERATOR(Vim_Operator);
 
 enum Vim_Modifier {
@@ -820,7 +820,7 @@ struct Vim_Key_Binding {
     };
 };
 
-struct Vim_Binding_Handler {
+struct Vim_Binding_Map {
     b32 initialized;
 
     Arena node_arena;
@@ -830,54 +830,50 @@ struct Vim_Binding_Handler {
     Table_u64_u64 keybind_table;
 };
 
-global Vim_Binding_Handler vim_map_normal;
-global Vim_Binding_Handler vim_map_visual;
-global Vim_Binding_Handler vim_map_operator_pending;
+global Vim_Binding_Map vim_map_normal;
+global Vim_Binding_Map vim_map_visual;
+global Vim_Binding_Map vim_map_text_objects;
+global Vim_Binding_Map vim_map_operator_pending;
 
-internal void deep_copy_vim_keybind_table(Vim_Binding_Handler* handler, Table_u64_u64* dest, Table_u64_u64* source) {
-    *dest = make_table_u64_u64(&handler->allocator, source->slot_count);
+internal void vim_initialize_binding_map(Application_Links* app, Vim_Binding_Map* map) {
+    block_zero_struct(map);
 
-    dest->used_count = source->used_count;
-    dest->dirty_count = source->dirty_count;
+    map->initialized = true;
+    map->node_arena = make_arena_system(KB(2));
+    heap_init(&map->heap, &map->node_arena);
+    map->allocator = base_allocator_on_heap(&map->heap);
+
+    map->keybind_table = make_table_u64_u64(&map->allocator, 32);
+}
+
+internal void vim_add_parent_binding_map(Vim_Binding_Map* map, Table_u64_u64* dest, Table_u64_u64* source) {
+    Assert(map->initialized);
 
     for (u32 slot_index = 0; slot_index < source->slot_count; slot_index++) {
-        dest->keys[slot_index] = source->keys[slot_index];
+        u64 key   = source->keys[slot_index];
         u64 value = source->vals[slot_index];
         if (value) {
             Vim_Key_Binding* source_bind = cast(Vim_Key_Binding*) IntAsPtr(value);
-            Vim_Key_Binding* dest_bind = push_array(&handler->node_arena, Vim_Key_Binding, 1);
+            Vim_Key_Binding* dest_bind = 0;
+            if (!table_read(dest, key, cast(u64*) &dest_bind)) {
+                dest_bind = push_array(&map->node_arena, Vim_Key_Binding, 1);
+            }
 
             block_copy_struct(dest_bind, source_bind);
 
             if (dest_bind->kind == VimBindingKind_Nested) {
-                dest_bind->nested_keybind_table = push_array(&handler->node_arena, Table_u64_u64, 1);
-                deep_copy_vim_keybind_table(handler, dest_bind->nested_keybind_table, source_bind->nested_keybind_table);
+                dest_bind->nested_keybind_table = push_array(&map->node_arena, Table_u64_u64, 1);
+                *dest_bind->nested_keybind_table = make_table_u64_u64(&map->allocator, 8);
+                vim_add_parent_binding_map(map, dest_bind->nested_keybind_table, source_bind->nested_keybind_table);
             }
 
-            dest->vals[slot_index] = PtrAsInt(dest_bind);
-        } else {
-            dest->vals[slot_index] = 0;
+            table_insert(dest, key, PtrAsInt(dest_bind));
         }
     }
 }
 
-internal void vim_initialize_binding_handler(Application_Links* app, Vim_Binding_Handler* handler, Vim_Binding_Handler* parent = 0) {
-    block_zero_struct(handler);
-
-    handler->initialized = true;
-    handler->node_arena = make_arena_system(KB(2));
-    heap_init(&handler->heap, &handler->node_arena);
-    handler->allocator = base_allocator_on_heap(&handler->heap);
-
-    if (parent) {
-        deep_copy_vim_keybind_table(handler, &handler->keybind_table, &parent->keybind_table);
-    } else {
-        handler->keybind_table = make_table_u64_u64(&handler->allocator, 32);
-    }
-}
-
-internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Handler* handler, Table_u64_u64* table, Vim_Key key, b32 make_if_doesnt_exist) {
-    Assert(handler);
+internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Map* map, Table_u64_u64* table, Vim_Key key, b32 make_if_doesnt_exist) {
+    Assert(map);
     Assert(table);
 
     Vim_Key_Binding* result = 0;
@@ -901,11 +897,11 @@ internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Handler* hand
 
     if (!result && make_if_doesnt_exist) {
         if (hash_hi) {
-            result = push_array_zero(&handler->node_arena, Vim_Key_Binding, 1);
+            result = push_array_zero(&map->node_arena, Vim_Key_Binding, 1);
             table_insert(table, hash_hi, PtrAsInt(result));
         }
         if (hash_lo) {
-            result = push_array_zero(&handler->node_arena, Vim_Key_Binding, 1);
+            result = push_array_zero(&map->node_arena, Vim_Key_Binding, 1);
             table_insert(table, hash_lo, PtrAsInt(result));
         }
     }
@@ -1083,13 +1079,13 @@ internal void vim_print_bind(Application_Links* app, Vim_Key_Binding* bind) {
     }
 }
 
-internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Handler* handler, Vim_Binding_Handler* fallback, VimQueryMode mode) {
+internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Map* map, Vim_Binding_Map* fallback, VimQueryMode mode) {
     Vim_Key key = vim_get_key_from_input_query(app, mode);
 
-    Vim_Key_Binding* bind = make_or_retrieve_vim_binding(handler, &handler->keybind_table, key, false);
+    Vim_Key_Binding* bind = make_or_retrieve_vim_binding(map, &map->keybind_table, key, false);
     Vim_Key_Binding* fallback_bind = 0;
     if (fallback) {
-        fallback_bind = make_or_retrieve_vim_binding(handler, &fallback->keybind_table, key, false);
+        fallback_bind = make_or_retrieve_vim_binding(map, &fallback->keybind_table, key, false);
     }
 
     if (!bind) {
@@ -1103,10 +1099,10 @@ internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_
 
     while (bind && bind->kind == VimBindingKind_Nested) {
         key  = vim_get_key_from_next_input(app);
-        bind = make_or_retrieve_vim_binding(handler, bind->nested_keybind_table, key, false);
+        bind = make_or_retrieve_vim_binding(map, bind->nested_keybind_table, key, false);
 
         if (fallback_bind && fallback_bind->kind == VimBindingKind_Nested) {
-            fallback_bind = make_or_retrieve_vim_binding(handler, fallback_bind->nested_keybind_table, key, false);
+            fallback_bind = make_or_retrieve_vim_binding(map, fallback_bind->nested_keybind_table, key, false);
         }
 
         if (!bind) {
@@ -1739,14 +1735,14 @@ internal Range_i64 vim_seek_motion_result(Application_Links* app, View_ID view, 
     return result;
 }
 
-internal Vim_Binding_Handler* vim_get_handler_for_mode(Vim_Mode mode) {
-    Vim_Binding_Handler* handler = 0;
+internal Vim_Binding_Map* vim_get_map_for_mode(Vim_Mode mode) {
+    Vim_Binding_Map* map = 0;
     if (is_vim_visual_mode(mode)) {
-        handler = &vim_map_visual;
+        map = &vim_map_visual;
     } else if (mode == VimMode_Normal) {
-        handler = &vim_map_normal;
+        map = &vim_map_normal;
     }
-    return handler;
+    return map;
 }
 
 internal void vim_select_range(Application_Links* app, View_ID view, Range_i64 range) {
@@ -1760,8 +1756,8 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
 
-    Vim_Binding_Handler* handler = vim_get_handler_for_mode(vim_buffer->mode);
-    Assert(handler);
+    Vim_Binding_Map* map = vim_get_map_for_mode(vim_buffer->mode);
+    Assert(map);
 
     if (!vim_state.recording_command && !get_current_input_is_virtual(app)) {
         Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
@@ -1776,7 +1772,7 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
     i32 op_count = cast(i32) clamp(1, queried_number, max_i32);
     b32 op_count_was_set = (queried_number != 0);
 
-    Vim_Key_Binding* bind = vim_query_binding(app, handler, 0, VimQuery_CurrentInput);
+    Vim_Key_Binding* bind = vim_query_binding(app, map, 0, VimQuery_CurrentInput);
 
     if (bind) {
         Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
@@ -1825,7 +1821,7 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
 
             case VimBindingKind_Operator: {
                 // vim_set_selection(app, view, selection); // @VisualRepeat
-                bind->op(app, handler, view, buffer, selection, op_count, op_count_was_set);
+                bind->op(app, map, view, buffer, selection, op_count, op_count_was_set);
             } break;
 
             case VimBindingKind_4CoderCommand: {
@@ -1858,27 +1854,27 @@ CUSTOM_COMMAND_SIG(vim_handle_input) {
     vim_state.chord_bar.size = 0;
 }
 
-internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Handler* handler, Vim_Key_Sequence binding_sequence, b32 clear = true) {
+internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence binding_sequence, b32 clear = true) {
     Vim_Key_Binding* result = 0;
 
-    Assert(handler->initialized);
+    Assert(map->initialized);
 
     if (binding_sequence.count > 0) {
         Vim_Key key1 = binding_sequence.keys[0];
-        result = make_or_retrieve_vim_binding(handler, &handler->keybind_table, key1, true);
+        result = make_or_retrieve_vim_binding(map, &map->keybind_table, key1, true);
 
         for (i32 key_index = 1; key_index < binding_sequence.count; key_index++) {
             Vim_Key next_key = binding_sequence.keys[key_index];
             if (result->kind != VimBindingKind_Nested) {
                 result->kind = VimBindingKind_Nested;
 
-                Table_u64_u64* inner_table = push_array(&handler->node_arena, Table_u64_u64, 1);
-                *inner_table = make_table_u64_u64(&handler->allocator, 8);
+                Table_u64_u64* inner_table = push_array(&map->node_arena, Table_u64_u64, 1);
+                *inner_table = make_table_u64_u64(&map->allocator, 8);
 
                 result->nested_keybind_table = inner_table;
             }
 
-            result = make_or_retrieve_vim_binding(handler, result->nested_keybind_table, next_key, true);
+            result = make_or_retrieve_vim_binding(map, result->nested_keybind_table, next_key, true);
         }
     }
 
@@ -1889,27 +1885,27 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Handler* handler, Vim_Key_
     return result;
 }
 
-#define vim_bind_motion(handler, motion, key1, ...) vim_bind_motion_(handler, motion, string_u8_litexpr(#motion), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_motion_(Vim_Binding_Handler* handler, Vim_Motion* motion, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = add_vim_binding(handler, sequence);
+#define vim_bind_motion(map, motion, key1, ...) vim_bind_motion_(map, motion, string_u8_litexpr(#motion), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_motion_(Vim_Binding_Map* map, Vim_Motion* motion, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = add_vim_binding(map, sequence);
     bind->kind = VimBindingKind_Motion;
     bind->description = description;
     bind->motion = motion;
     return bind;
 }
 
-#define vim_bind_text_object(handler, text_object, key1, ...) vim_bind_text_object_(handler, text_object, string_u8_litexpr(#text_object), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_text_object_(Vim_Binding_Handler* handler, Vim_Text_Object* text_object, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = add_vim_binding(handler, sequence);
+#define vim_bind_text_object(map, text_object, key1, ...) vim_bind_text_object_(map, text_object, string_u8_litexpr(#text_object), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_text_object_(Vim_Binding_Map* map, Vim_Text_Object* text_object, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = add_vim_binding(map, sequence);
     bind->kind = VimBindingKind_TextObject;
     bind->description = description;
     bind->text_object = text_object;
     return bind;
 }
 
-#define vim_bind_operator(handler, op, key1, ...) vim_bind_operator_(handler, op, string_u8_litexpr(#op), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_operator_(Vim_Binding_Handler* handler, Vim_Operator* op, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = add_vim_binding(handler, sequence);
+#define vim_bind_operator(map, op, key1, ...) vim_bind_operator_(map, op, string_u8_litexpr(#op), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_operator_(Vim_Binding_Map* map, Vim_Operator* op, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = add_vim_binding(map, sequence);
     bind->kind = VimBindingKind_Operator;
     bind->description = description;
     bind->flags |= VimBindingFlag_IsRepeatable|VimBindingFlag_WriteOnly;
@@ -1917,53 +1913,53 @@ internal Vim_Key_Binding* vim_bind_operator_(Vim_Binding_Handler* handler, Vim_O
     return bind;
 }
 
-#define vim_bind_fcoder_command(handler, cmd, key1, ...) vim_bind_fcoder_command_(handler, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_fcoder_command_(Vim_Binding_Handler* handler, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = add_vim_binding(handler, sequence);
+#define vim_bind_fcoder_command(map, cmd, key1, ...) vim_bind_fcoder_command_(map, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_fcoder_command_(Vim_Binding_Map* map, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = add_vim_binding(map, sequence);
     bind->kind = VimBindingKind_4CoderCommand;
     bind->description = description;
     bind->fcoder_command = fcoder_command;
     return bind;
 }
 
-#define vim_bind_text_command(handler, cmd, key1, ...) vim_bind_text_command_(handler, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_text_command_(Vim_Binding_Handler* handler, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = vim_bind_fcoder_command_(handler, fcoder_command, description, sequence);
+#define vim_bind_text_command(map, cmd, key1, ...) vim_bind_text_command_(map, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_text_command_(Vim_Binding_Map* map, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = vim_bind_fcoder_command_(map, fcoder_command, description, sequence);
     bind->flags |= VimBindingFlag_IsRepeatable|VimBindingFlag_WriteOnly;
     return bind;
 }
 
-#define vim_bind(handler, cmd, key1, ...) vim_bind_(handler, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_bind_(Vim_Binding_Handler* handler, Vim_Motion* motion, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    return vim_bind_motion_(handler, motion, description, sequence);
+#define vim_bind(map, cmd, key1, ...) vim_bind_(map, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_bind_(Vim_Binding_Map* map, Vim_Motion* motion, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    return vim_bind_motion_(map, motion, description, sequence);
 }
 
-internal Vim_Key_Binding* vim_bind_(Vim_Binding_Handler* handler, Vim_Text_Object* text_object, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    return vim_bind_text_object_(handler, text_object, description, sequence);
+internal Vim_Key_Binding* vim_bind_(Vim_Binding_Map* map, Vim_Text_Object* text_object, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    return vim_bind_text_object_(map, text_object, description, sequence);
 }
 
-internal Vim_Key_Binding* vim_bind_(Vim_Binding_Handler* handler, Vim_Operator* op, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    return vim_bind_operator_(handler, op, description, sequence);
+internal Vim_Key_Binding* vim_bind_(Vim_Binding_Map* map, Vim_Operator* op, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    return vim_bind_operator_(map, op, description, sequence);
 }
 
-internal Vim_Key_Binding* vim_bind_(Vim_Binding_Handler* handler, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    return vim_bind_fcoder_command_(handler, fcoder_command, description, sequence);
+internal Vim_Key_Binding* vim_bind_(Vim_Binding_Map* map, Custom_Command_Function* fcoder_command, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    return vim_bind_fcoder_command_(map, fcoder_command, description, sequence);
 }
 
-#define vim_name_bind(handler, description, key1, ...) vim_name_bind_(handler, description, vim_key_sequence(key1, ##__VA_ARGS__))
-internal Vim_Key_Binding* vim_name_bind_(Vim_Binding_Handler* handler, String_Const_u8 description, Vim_Key_Sequence sequence) {
-    Vim_Key_Binding* bind = add_vim_binding(handler, sequence, false);
+#define vim_name_bind(map, description, key1, ...) vim_name_bind_(map, description, vim_key_sequence(key1, ##__VA_ARGS__))
+internal Vim_Key_Binding* vim_name_bind_(Vim_Binding_Map* map, String_Const_u8 description, Vim_Key_Sequence sequence) {
+    Vim_Key_Binding* bind = add_vim_binding(map, sequence, false);
     bind->description = description;
     return bind;
 }
 
-#define vim_unbind(handler, key1, ...) vim_unbind_(handler, vim_key_sequence(key1, ##__VA_ARGS__))
-internal void vim_unbind_(Vim_Binding_Handler* handler, Vim_Key_Sequence sequence) {
+#define vim_unbind(map, key1, ...) vim_unbind_(map, vim_key_sequence(key1, ##__VA_ARGS__))
+internal void vim_unbind_(Vim_Binding_Map* map, Vim_Key_Sequence sequence) {
     Vim_Key_Binding* bind = 0;
-    Table_u64_u64* keybind_table = &handler->keybind_table;
+    Table_u64_u64* keybind_table = &map->keybind_table;
     for (i32 key_index = 0; key_index < sequence.count; key_index++) {
         Vim_Key key = sequence.keys[key_index];
-        bind = make_or_retrieve_vim_binding(handler, keybind_table, key, false);
+        bind = make_or_retrieve_vim_binding(map, keybind_table, key, false);
         if (bind->kind == VimBindingKind_Nested) {
             keybind_table = bind->nested_keybind_table;
         } else {
@@ -1975,12 +1971,13 @@ internal void vim_unbind_(Vim_Binding_Handler* handler, Vim_Key_Sequence sequenc
     }
 }
 
-#define VimInitializeMap(handler, ...) vim_initialize_binding_handler(app, &handler, ##__VA_ARGS__)
-#define VimMappingScope() Vim_Binding_Handler* vim_handler = 0
-#define VimSelectMap(handler) vim_handler = &(handler)
-#define VimBind(cmd, key1, ...) vim_bind_(vim_handler, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
-#define VimUnbind(key1, ...) vim_unbind_(vim_handler, vim_key_sequence(key1, ##__VA_ARGS__))
-#define VimNameBind(description, key1, ...) vim_name_bind_(vim_handler, description, vim_key_sequence(key1, ##__VA_ARGS__))
+#define VimInitializeMap(map, ...) vim_initialize_binding_map(app, &map, ##__VA_ARGS__)
+#define VimAddParentMap(parent) vim_add_parent_binding_map(vim_map, &vim_map->keybind_table, &(parent).keybind_table)
+#define VimMappingScope() Vim_Binding_Map* vim_map = 0
+#define VimSelectMap(map) vim_map = &(map)
+#define VimBind(cmd, key1, ...) vim_bind_(vim_map, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
+#define VimUnbind(key1, ...) vim_unbind_(vim_map, vim_key_sequence(key1, ##__VA_ARGS__))
+#define VimNameBind(description, key1, ...) vim_name_bind_(vim_map, description, vim_key_sequence(key1, ##__VA_ARGS__))
 
 internal i64 vim_boundary_whitespace(Application_Links *app, Buffer_ID buffer, Side side, Scan_Direction direction, i64 pos) {
     return(boundary_predicate(app, buffer, side, direction, pos, &character_predicate_whitespace));
@@ -3235,7 +3232,7 @@ enum Vim_DCY {
     VimDCY_Yank,
 };
 
-internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, b32 query_motion, Vim_Motion* motion = 0) {
+internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, b32 query_motion, Vim_Motion* motion = 0) {
     // @TODO: This whole function is weird and stupid...
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
@@ -3309,35 +3306,35 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Hand
 }
 
 internal VIM_OPERATOR(vim_delete) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete, true);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete, true);
 }
 
 internal VIM_OPERATOR(vim_delete_character) {
     // @TODO: At the end of the line, this will delete the newline rather than step back and delete the last character on the line, contrary to vim's behaviour.
     //        It's a little annoying, so I want to make sure to get it consistent with him.
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
 }
 
 internal VIM_OPERATOR(vim_change) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change, true);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Change, vim_change, true);
 }
 
 internal VIM_OPERATOR(vim_yank) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, true);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Yank, vim_yank, true);
 }
 
 internal VIM_OPERATOR(vim_delete_eol) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Delete, vim_delete, false, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_change_eol) {
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Change, vim_change, false, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Change, vim_change, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_yank_eol) {
     // NOTE: This is vim's default behaviour (cuz it's vi compatible)
-    // vim_delete_change_or_yank(app, handler, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
-    vim_delete_change_or_yank(app, handler, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
+    // vim_delete_change_or_yank(app, map, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
+    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_replace) {
@@ -3708,7 +3705,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
     return did_align;
 }
 
-internal void vim_align_internal(Application_Links* app, Vim_Binding_Handler* handler, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
+internal void vim_align_internal(Application_Links* app, Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
     if (selection.kind == VimSelectionKind_Block || selection.kind == VimSelectionKind_Line) {
            String_Const_u8 align_target = vim_get_next_writable(app);
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
@@ -3732,11 +3729,11 @@ internal void vim_align_internal(Application_Links* app, Vim_Binding_Handler* ha
 }
 
 internal VIM_OPERATOR(vim_align) {
-    vim_align_internal(app, handler, view, buffer, selection, count, false);
+    vim_align_internal(app, map, view, buffer, selection, count, false);
 }
 
 internal VIM_OPERATOR(vim_align_right) {
-    vim_align_internal(app, handler, view, buffer, selection, count, true);
+    vim_align_internal(app, map, view, buffer, selection, count, true);
 }
 
 internal VIM_OPERATOR(vim_new_line_below) {
@@ -4774,7 +4771,7 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
         Command_Binding binding = map_get_binding_recursive(&framework_mapping, map_id, &input.event);
 
         Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, buffer_scope, vim_buffer_attachment, Vim_Buffer_Attachment);
-        Vim_Binding_Handler* handler = vim_get_handler_for_mode(vim_buffer->mode);
+        Vim_Binding_Map* map = vim_get_map_for_mode(vim_buffer->mode);
 
         if (!vim_state.recording_command && !get_current_input_is_virtual(app)) {
             Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
@@ -4788,8 +4785,8 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
         b32 op_count_was_set = (queried_number != 0);
 
         Vim_Key_Binding* vim_bind = 0;
-        if (handler && handler->initialized) {
-            vim_bind = vim_query_binding(app, handler, 0, VimQuery_CurrentInput);
+        if (map && map->initialized) {
+            vim_bind = vim_query_binding(app, map, 0, VimQuery_CurrentInput);
         }
 
         Managed_Scope scope = view_get_managed_scope(app, view);
@@ -4866,7 +4863,7 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
 
                         case VimBindingKind_Operator: {
                             // vim_set_selection(app, view, selection); // @VisualRepeat
-                            vim_bind->op(app, handler, view, buffer, selection, op_count, op_count_was_set);
+                            vim_bind->op(app, map, view, buffer, selection, op_count, op_count_was_set);
                         } break;
 
                         case VimBindingKind_4CoderCommand: {
@@ -5144,8 +5141,20 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     BindCore(click_set_cursor_and_mark, CoreCode_ClickActivateView);
     BindMouseMove(click_set_cursor_if_lbutton);
 
+    VimInitializeMap(vim_map_text_objects);
+    VimSelectMap(vim_map_text_objects);
+
+    VimBind(vim_text_object_inner_scope,                         vim_char('i'), vim_char('{'));
+    VimBind(vim_text_object_inner_scope,                         vim_char('i'), vim_char('}'));
+    VimBind(vim_text_object_inner_paren,                         vim_char('i'), vim_char('('));
+    VimBind(vim_text_object_inner_paren,                         vim_char('i'), vim_char(')'));
+    VimBind(vim_text_object_inner_single_quotes,                 vim_char('i'), vim_char('\''));
+    VimBind(vim_text_object_inner_double_quotes,                 vim_char('i'), vim_char('"'));
+    VimBind(vim_text_object_inner_word,                          vim_char('i'), vim_char('w'));
+
     VimInitializeMap(vim_map_operator_pending);
     VimSelectMap(vim_map_operator_pending);
+    VimAddParentMap(vim_map_text_objects);
 
     VimBind(vim_motion_left,                                     vim_char('h'));
     VimBind(vim_motion_down,                                     vim_char('j'));
@@ -5186,18 +5195,9 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_text_object_isearch_repeat_forward,              vim_char('g'), vim_char('n'));
     VimBind(vim_text_object_isearch_repeat_backward,             vim_char('g'), vim_char('N'));
 
-    VimBind(vim_text_object_inner_scope,                         vim_char('i'), vim_char('{'));
-    VimBind(vim_text_object_inner_scope,                         vim_char('i'), vim_char('}'));
-    VimBind(vim_text_object_inner_paren,                         vim_char('i'), vim_char('('));
-    VimBind(vim_text_object_inner_paren,                         vim_char('i'), vim_char(')'));
-    VimBind(vim_text_object_inner_single_quotes,                 vim_char('i'), vim_char('\''));
-    VimBind(vim_text_object_inner_double_quotes,                 vim_char('i'), vim_char('"'));
-    VimBind(vim_text_object_inner_word,                          vim_char('i'), vim_char('w'));
-
-    // @TODO: It would be nice if you didn't have to take the address of the parent map.
-    // @TODO: Really, we should have VimAddParentMap(parent) instead, and get around that entirely. I want multiple parents to be supported.
-    VimInitializeMap(vim_map_normal, &vim_map_operator_pending);
+    VimInitializeMap(vim_map_normal);
     VimSelectMap(vim_map_normal);
+    VimAddParentMap(vim_map_operator_pending);
 
     VimBind(vim_register,                                        vim_char('"'));
 
@@ -5328,28 +5328,30 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     SelectMap(vim_mapid_visual);
     ParentMap(vim_mapid_normal);
 
-    VimInitializeMap(vim_map_visual, &vim_map_normal);
+    VimInitializeMap(vim_map_visual);
     VimSelectMap(vim_map_visual);
+    VimAddParentMap(vim_map_normal);
+    VimAddParentMap(vim_map_text_objects);
 
     VimUnbind(vim_char('i'));
     VimUnbind(vim_char('a'));
     
-    VimBind(vim_text_object_inner_scope,                    vim_char('i'), vim_char('{'));
-    VimBind(vim_text_object_inner_scope,                    vim_char('i'), vim_char('}'));
-    VimBind(vim_text_object_inner_paren,                    vim_char('i'), vim_char('('));
-    VimBind(vim_text_object_inner_paren,                    vim_char('i'), vim_char(')'));
-    VimBind(vim_text_object_inner_single_quotes,            vim_char('i'), vim_char('\''));
-    VimBind(vim_text_object_inner_double_quotes,            vim_char('i'), vim_char('"'));
-    VimBind(vim_text_object_inner_word,                     vim_char('i'), vim_char('w'));
+    VimBind(vim_text_object_inner_scope,         vim_char('i'), vim_char('{'));
+    VimBind(vim_text_object_inner_scope,         vim_char('i'), vim_char('}'));
+    VimBind(vim_text_object_inner_paren,         vim_char('i'), vim_char('('));
+    VimBind(vim_text_object_inner_paren,         vim_char('i'), vim_char(')'));
+    VimBind(vim_text_object_inner_single_quotes, vim_char('i'), vim_char('\''));
+    VimBind(vim_text_object_inner_double_quotes, vim_char('i'), vim_char('"'));
+    VimBind(vim_text_object_inner_word,          vim_char('i'), vim_char('w'));
     
-    VimBind(vim_enter_visual_insert_mode, vim_char('I'));
-    VimBind(vim_enter_visual_append_mode, vim_char('A'));
+    VimBind(vim_enter_visual_insert_mode,        vim_char('I'));
+    VimBind(vim_enter_visual_append_mode,        vim_char('A'));
 
-    VimBind(vim_lowercase, vim_char('u'));
-    VimBind(vim_uppercase, vim_char('U'));
+    VimBind(vim_lowercase,                       vim_char('u'));
+    VimBind(vim_uppercase,                       vim_char('U'));
 
-    VimBind(vim_isearch_selection,         vim_char('/'));
-    VimBind(vim_reverse_isearch_selection, vim_char('?'));
+    VimBind(vim_isearch_selection,               vim_char('/'));
+    VimBind(vim_reverse_isearch_selection,       vim_char('?'));
 }
 
 internal void vim_init(Application_Links* app) {
