@@ -102,8 +102,7 @@
 // Things to maybe do:
 // - Insert line comments on return
 // - Disable mouse during insert mode (to avoid stupid palming of my touchpad)
-// - Fix whatever's wrong with selection on command repeat - probably just rethink exactly how this should work
-// - People like that thing where they can use some textual keys to escape from insert mode, I don't really get it but I'm not against implementing it
+// - People like that thing where they can use some textual key sequence to escape from insert mode, I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
 // - Create a non-stopgap solution to case sensitive / whole word searches (tab during search query would be better suited to auto complete)
 // - Do stuff with 0-9 registers (or yeet them because... does anybody use these?)
@@ -114,8 +113,9 @@
 // - Clamp left / right motions to line
 // - Disallow sitting on the newline
 // - Support marks as motions
-// - changing the order in which I call VimAddParentMap for my visual mode map changed whether or not gg worked, despite - so far as I can tell - there not being any
+// - Changing the order in which I call VimAddParentMap for my visual mode map changed whether or not gg worked, despite - so far as I can tell - there not being any
 //   conflicting bindings. Why?
+// - Apparently, vim has some weird timing thing regarding conflicting binds. I've never noticed it, and it seems awful. But if you're weird, you could implement it.
 
 //
 // Internal Defines
@@ -878,7 +878,7 @@ struct Vim_Key_Binding {
     u32              flags;
     union {
         void*                    generic;
-        Table_u64_u64*           nested_keybind_table;
+        Table_u64_u64*           keybind_table;
         Vim_Motion*              motion;
         Vim_Text_Object*         text_object;
         Vim_Operator*            op;
@@ -890,6 +890,7 @@ struct Vim_Binding_Map {
     b32 initialized;
 
     // @TODO: Is there a strong compelling reason to bother making individual arenas and heaps for each map?
+    //        If not, we can get rid of this entirely and Vim_Binding_Map would just be a Table_u64_u64, which would simplify the functions dealing with it.
     Arena node_arena;
     Heap heap;
     Base_Allocator allocator;
@@ -927,11 +928,11 @@ internal void vim_add_parent_binding_map(Vim_Binding_Map* map, Table_u64_u64* de
             }
 
             if (source_bind->kind == VimBindingKind_Nested) {
-                if (dest_bind->kind != VimBindingKind_Nested || !dest_bind->nested_keybind_table) {
-                    dest_bind->nested_keybind_table = push_array(&map->node_arena, Table_u64_u64, 1);
-                    *dest_bind->nested_keybind_table = make_table_u64_u64(&map->allocator, 8);
+                if (dest_bind->kind != VimBindingKind_Nested || !dest_bind->keybind_table) {
+                    dest_bind->keybind_table = push_array(&map->node_arena, Table_u64_u64, 1);
+                    *dest_bind->keybind_table = make_table_u64_u64(&map->allocator, 8);
                 }
-                vim_add_parent_binding_map(map, dest_bind->nested_keybind_table, source_bind->nested_keybind_table);
+                vim_add_parent_binding_map(map, dest_bind->keybind_table, source_bind->keybind_table);
             } else {
                 dest_bind->generic = source_bind->generic;
             }
@@ -945,7 +946,7 @@ internal void vim_add_parent_binding_map(Vim_Binding_Map* map, Table_u64_u64* de
     }
 }
 
-internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Map* map, Table_u64_u64* table, Vim_Key key, b32 make_if_doesnt_exist) {
+internal Vim_Key_Binding* make_or_retrieve_vim_binding_internal(Vim_Binding_Map* map, Table_u64_u64* table, Vim_Key key, b32 make_if_doesnt_exist) {
     Assert(map);
     Assert(table);
 
@@ -982,6 +983,14 @@ internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Map* map, Tab
     return result;
 }
 
+internal Vim_Key_Binding* retrieve_vim_binding(Vim_Binding_Map* map, Table_u64_u64* table, Vim_Key key) {
+    return make_or_retrieve_vim_binding_internal(map, table, key, false);
+}
+
+internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Map* map, Table_u64_u64* table, Vim_Key key) {
+    return make_or_retrieve_vim_binding_internal(map, table, key, true);
+}
+
 enum VimQueryMode {
     VimQuery_CurrentInput,
     VimQuery_NextInput,
@@ -990,7 +999,7 @@ enum VimQueryMode {
 internal void vim_append_chord_bar(String_Const_u8 string, u32 vim_mods) {
     String_Const_u8 append_string = string;
     if (string_match(string, string_u8_litexpr(" "))) {
-        append_string = string_u8_litexpr("\\ ");
+        append_string = string_u8_litexpr("\\");
     }
     if (HasFlag(vim_mods, VimModifier_Control)) {
         string_append_character(&vim_state.chord_bar, '^');
@@ -1155,10 +1164,10 @@ internal void vim_print_bind(Application_Links* app, Vim_Key_Binding* bind) {
 internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Map* map, Vim_Binding_Map* fallback, VimQueryMode mode) {
     Vim_Key key = vim_get_key_from_input_query(app, mode);
 
-    Vim_Key_Binding* bind = make_or_retrieve_vim_binding(map, &map->keybind_table, key, false);
+    Vim_Key_Binding* bind = retrieve_vim_binding(map, &map->keybind_table, key);
     Vim_Key_Binding* fallback_bind = 0;
     if (fallback) {
-        fallback_bind = make_or_retrieve_vim_binding(map, &fallback->keybind_table, key, false);
+        fallback_bind = retrieve_vim_binding(map, &fallback->keybind_table, key);
     }
 
     if (!bind) {
@@ -1172,10 +1181,10 @@ internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_
 
     while (bind && bind->kind == VimBindingKind_Nested) {
         key  = vim_get_key_from_next_input(app);
-        bind = make_or_retrieve_vim_binding(map, bind->nested_keybind_table, key, false);
+        bind = retrieve_vim_binding(map, bind->keybind_table, key);
 
         if (fallback_bind && fallback_bind->kind == VimBindingKind_Nested) {
-            fallback_bind = make_or_retrieve_vim_binding(map, fallback_bind->nested_keybind_table, key, false);
+            fallback_bind = retrieve_vim_binding(map, fallback_bind->keybind_table, key);
         }
 
         if (!bind) {
@@ -3986,7 +3995,7 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence
 
     if (binding_sequence.count > 0) {
         Vim_Key key1 = binding_sequence.keys[0];
-        result = make_or_retrieve_vim_binding(map, &map->keybind_table, key1, true);
+        result = make_or_retrieve_vim_binding(map, &map->keybind_table, key1);
 
         for (i32 key_index = 1; key_index < binding_sequence.count; key_index++) {
             Vim_Key next_key = binding_sequence.keys[key_index];
@@ -3996,10 +4005,10 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence
                 Table_u64_u64* inner_table = push_array(&map->node_arena, Table_u64_u64, 1);
                 *inner_table = make_table_u64_u64(&map->allocator, 8);
 
-                result->nested_keybind_table = inner_table;
+                result->keybind_table = inner_table;
             }
 
-            result = make_or_retrieve_vim_binding(map, result->nested_keybind_table, next_key, true);
+            result = make_or_retrieve_vim_binding(map, result->keybind_table, next_key);
         }
     }
 
@@ -4124,12 +4133,12 @@ internal void vim_unbind_(Vim_Binding_Map* map, Vim_Key_Sequence sequence) {
     Table_u64_u64* keybind_table = &map->keybind_table;
     for (i32 key_index = 0; key_index < sequence.count; key_index++) {
         Vim_Key key = sequence.keys[key_index];
-        bind = make_or_retrieve_vim_binding(map, keybind_table, key, false);
+        bind = retrieve_vim_binding(map, keybind_table, key);
 #if 1
         Assert(bind);
 #endif
         if (bind && bind->kind == VimBindingKind_Nested) {
-            keybind_table = bind->nested_keybind_table;
+            keybind_table = bind->keybind_table;
         } else {
             break;
         }
