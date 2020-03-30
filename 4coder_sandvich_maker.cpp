@@ -1,7 +1,7 @@
 #include "4coder_default_include.cpp"
 
 #define VIM_USE_CUSTOM_COLORS 1
-#define VIM_CURSOR_ROUNDNESS 0
+#define VIM_CURSOR_ROUNDNESS 0.0f
 
 #include "4coder_vimmish.cpp"
 

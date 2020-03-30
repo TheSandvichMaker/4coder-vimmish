@@ -7,14 +7,15 @@
     #include "4coder_default_include.cpp"
 
     You could override some defines here:
+    // #define VIM_MOUSE_SELECT_MODE             [Visual / VisualLine / VisualBlock]        [default: Visual]
     // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS [0 / 1]                                    [default: 1]
     // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK [0 / 1]                                    [default: 1]
     // #define VIM_AUTO_INDENT_ON_PASTE          [0 / 1]                                    [default: 1]
     // #define VIM_USE_CUSTOM_COLORS             [0 / 1]                                    [default: 1]
     // #define VIM_DEFAULT_REGISTER              [unnamed_register / clipboard_register]    [default: unnamed_register]
-    // #define VIM_JUMP_HISTORY_SIZE             [integer]                                  [default: 256]
+    // #define VIM_JUMP_HISTORY_SIZE             [integer]                                  [default: 100]
     // #define VIM_MAXIMUM_OP_COUNT              [integer]                                  [default: 256]
-    // #define VIM_CURSOR_ROUNDNESS              [expression that evaluates to a float]     [default: (metrics.normal_advance*0.5f)*0.9f]
+    // #define VIM_CURSOR_ROUNDNESS              [float]                                    [default: 0.9f]
 
     #include "4coder_vimmish.cpp"
 
@@ -55,6 +56,10 @@
 // User-Configuable Defines
 //
 
+#ifndef VIM_MOUSE_SELECT_MODE
+#define VIM_MOUSE_SELECT_MODE Visual
+#endif
+
 #ifndef VIM_USE_CHARACTER_SEEK_HIGHLIGHTS
 #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 1
 #endif
@@ -76,7 +81,7 @@
 #endif
 
 #ifndef VIM_JUMP_HISTORY_SIZE
-#define VIM_JUMP_HISTORY_SIZE 256
+#define VIM_JUMP_HISTORY_SIZE 100
 #endif
 
 #ifndef VIM_MAXIMUM_OP_COUNT
@@ -84,16 +89,15 @@
 #endif
 
 #ifndef VIM_CURSOR_ROUNDNESS
-#define VIM_CURSOR_ROUNDNESS (metrics.normal_advance*0.5f)*0.9f
+#define VIM_CURSOR_ROUNDNESS 0.9f
 #endif
 
 //
 //
 //
 
-// Two important major changes:
+// Important major change:
 // - Make command repetition work by storing the command and the required motion / selection information to execute it rather than using macros
-// - Separte text objects from motions as a separate concept
 
 // Things to maybe do:
 // - Insert line comments on return
@@ -110,6 +114,8 @@
 // - Clamp left / right motions to line
 // - Disallow sitting on the newline
 // - Support marks as motions
+// - changing the order in which I call VimAddParentMap for my visual mode map changed whether or not gg worked, despite - so far as I can tell - there not being any
+//   conflicting bindings. Why?
 
 //
 // Internal Defines
@@ -483,7 +489,7 @@ internal void vim_delete_jump_history_at_index(Application_Links* app, Vim_View_
             // @Speed
             for (i32 shift = 0; shift < jumps_left - 1; shift++) {
                 i32 shift_index = jump_index + shift;
-                vim_view->jump_history[shift_index % ArrayCount(vim_view->jump_history)] = vim_view->jump_history[(shift_index + 1) % ArrayCount(vim_view->jump_history)];
+                ArraySafe(vim_view->jump_history, shift_index) = ArraySafe(vim_view->jump_history, shift_index + 1);
             }
         }
     }
@@ -501,7 +507,7 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
 
     Scratch_Block scratch(app);
     for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
-        Tiny_Jump test_jump = vim_view->jump_history[jump_index % ArrayCount(vim_view->jump_history)];
+        Tiny_Jump test_jump = ArraySafe(vim_view->jump_history, jump_index);
         if (test_jump.buffer == buffer) {
             i64 test_line = get_line_number_from_pos(app, buffer, test_jump.pos); // @Speed
             if (test_line == line) {
@@ -515,7 +521,7 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
     jump.buffer = buffer;
     jump.pos = pos;
 
-    vim_view->jump_history[(vim_view->jump_history_cursor++) % ArrayCount(vim_view->jump_history)] = jump;
+    ArraySafe(vim_view->jump_history, vim_view->jump_history_cursor++) = jump;
 
     vim_view->jump_history_one_past_max = vim_view->jump_history_cursor;
     i32 unsafe_index = vim_view->jump_history_one_past_max - ArrayCount(vim_view->jump_history);
@@ -541,13 +547,13 @@ CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
 #if 0
     // NOTE: vim doesn't do this, but I feel like it's nice behaviour
     if (vim_view->jump_history_cursor == vim_view->jump_history_one_past_max) {
-        vim_log_jump_history(app, false); // Passing false here would insert the history only if the line doesn't have a jump yet, and it wouldn't advance the history cursor.
+        vim_log_jump_history(app, false); // Passing false here would add the history only if the line doesn't have a jump yet, and it wouldn't advance the history cursor.
         vim_view->jump_history_cursor--;
     }
 #endif
 
     if (vim_view->jump_history_cursor > vim_view->jump_history_min) {
-        Tiny_Jump jump = vim_view->jump_history[(--vim_view->jump_history_cursor) % ArrayCount(vim_view->jump_history)];
+        Tiny_Jump jump = ArraySafe(vim_view->jump_history, --vim_view->jump_history_cursor);
         jump_to_location(app, view, jump.buffer, jump.pos);
         vim_view->dont_log_this_buffer_jump = true;
     }
@@ -559,7 +565,7 @@ CUSTOM_COMMAND_SIG(vim_step_forward_jump_history) {
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
     if (vim_view->jump_history_cursor + 1 < vim_view->jump_history_one_past_max) {
-        Tiny_Jump jump = vim_view->jump_history[(++vim_view->jump_history_cursor) % ArrayCount(vim_view->jump_history)];
+        Tiny_Jump jump = ArraySafe(vim_view->jump_history, ++vim_view->jump_history_cursor);
         jump_to_location(app, view, jump.buffer, jump.pos);
         vim_view->dont_log_this_buffer_jump = true;
     }
@@ -618,7 +624,7 @@ struct Vim_Text_Object_Result {
     u32 flags;
 };
 
-internal Vim_Text_Object_Result vim_text_object_exclusive(i64 pos) {
+internal Vim_Text_Object_Result vim_text_object(i64 pos) {
     Vim_Text_Object_Result result = {};
     result.range = Ii64(pos, pos);
     result.style = VimRangeStyle_Exclusive;
@@ -871,6 +877,7 @@ struct Vim_Key_Binding {
     String_Const_u8  description;
     u32              flags;
     union {
+        void*                    generic;
         Table_u64_u64*           nested_keybind_table;
         Vim_Motion*              motion;
         Vim_Text_Object*         text_object;
@@ -882,6 +889,7 @@ struct Vim_Key_Binding {
 struct Vim_Binding_Map {
     b32 initialized;
 
+    // @TODO: Is there a strong compelling reason to bother making individual arenas and heaps for each map?
     Arena node_arena;
     Heap heap;
     Base_Allocator allocator;
@@ -915,16 +923,22 @@ internal void vim_add_parent_binding_map(Vim_Binding_Map* map, Table_u64_u64* de
             Vim_Key_Binding* source_bind = cast(Vim_Key_Binding*) IntAsPtr(value);
             Vim_Key_Binding* dest_bind = 0;
             if (!table_read(dest, key, cast(u64*) &dest_bind)) {
-                dest_bind = push_array(&map->node_arena, Vim_Key_Binding, 1);
+                dest_bind = push_array_zero(&map->node_arena, Vim_Key_Binding, 1);
             }
 
-            block_copy_struct(dest_bind, source_bind);
-
-            if (dest_bind->kind == VimBindingKind_Nested) {
-                dest_bind->nested_keybind_table = push_array(&map->node_arena, Table_u64_u64, 1);
-                *dest_bind->nested_keybind_table = make_table_u64_u64(&map->allocator, 8);
+            if (source_bind->kind == VimBindingKind_Nested) {
+                if (dest_bind->kind != VimBindingKind_Nested || !dest_bind->nested_keybind_table) {
+                    dest_bind->nested_keybind_table = push_array(&map->node_arena, Table_u64_u64, 1);
+                    *dest_bind->nested_keybind_table = make_table_u64_u64(&map->allocator, 8);
+                }
                 vim_add_parent_binding_map(map, dest_bind->nested_keybind_table, source_bind->nested_keybind_table);
+            } else {
+                dest_bind->generic = source_bind->generic;
             }
+
+            dest_bind->kind        = source_bind->kind;
+            dest_bind->description = source_bind->description;
+            dest_bind->flags       = source_bind->flags;
 
             table_insert(dest, key, PtrAsInt(dest_bind));
         }
@@ -1754,8 +1768,11 @@ internal Range_i64 vim_apply_range_style(Application_Links* app, Buffer_ID buffe
         } break;
 
         case VimRangeStyle_Linewise: {
+            // @TODO: Should the resulting range be inclusive of the ending newline? I think so...
             Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
-            range = Ii64(get_line_start_pos(app, buffer, line_range.min), get_line_end_pos(app, buffer, line_range.max));
+            result = Ii64(get_line_start_pos(app, buffer, line_range.min), get_line_end_pos(app, buffer, line_range.max));
+            if (buffer_get_char(app, buffer, result.max) == '\r') result.max++;
+            if (buffer_get_char(app, buffer, result.max) == '\n') result.max++;
         } break;
     }
     return result;
@@ -1776,7 +1793,7 @@ internal Vim_Motion_Result vim_execute_motion(Application_Links* app, View_ID vi
 
 internal Vim_Text_Object_Result vim_execute_text_object(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Text_Object* text_object, i64 start_pos, i32 count, b32 count_was_set) {
     if (count < 0) count = 1;
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
     i64 pos = start_pos;
     result.range = Ii64_neg_inf;
     for (i32 i = 0; i < count; i++) {
@@ -2175,7 +2192,7 @@ function b32 vim_find_surrounding_nest(Application_Links *app, Buffer_ID buffer,
 
 internal Vim_Text_Object_Result vim_text_object_inner_nest_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, Find_Nest_Flag flags, b32 leave_inner_line, b32 select_inner_block) {
     // @TODO: Turn this function into not a total hot mess
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
 
     if (vim_find_surrounding_nest(app, buffer, start_pos, flags, &result.range, true)) {
         i64 min = result.range.min;
@@ -2227,7 +2244,7 @@ internal VIM_TEXT_OBJECT(vim_text_object_inner_paren) {
 }
 
 internal VIM_TEXT_OBJECT(vim_text_object_inner_double_quotes) {
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
     result.range = enclose_pos_inside_quotes(app, buffer, start_pos);
     return result;
 }
@@ -2248,13 +2265,13 @@ internal Range_i64 enclose_pos_inside_single_quotes(Application_Links *app, Buff
 }
 
 internal VIM_TEXT_OBJECT(vim_text_object_inner_single_quotes) {
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
     result.range = enclose_pos_inside_single_quotes(app, buffer, start_pos);
     return result;
 }
 
 internal VIM_TEXT_OBJECT(vim_text_object_inner_word) {
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
     result.range = enclose_boundary(app, buffer, Ii64(start_pos + 1), vim_boundary_word);
     return result;
 }
@@ -2792,7 +2809,7 @@ CUSTOM_COMMAND_SIG(vim_move_line_down) {
 }
 
 CUSTOM_COMMAND_SIG(vim_move_up_textual)
-CUSTOM_DOC("Moves up to the next line of actual text, regardless of line wrapping.")
+CUSTOM_DOC("[vim] Moves up to the next line of actual text, regardless of line wrapping.")
 {
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
     i64 pos = view_get_cursor_pos(app, view);
@@ -2815,7 +2832,7 @@ CUSTOM_COMMAND_SIG(vim_move_line_up) {
 }
 
 internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_forward) {
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
 
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
     result.range = vim_search_once_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
@@ -2824,7 +2841,7 @@ internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_forward) {
 }
 
 internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_backward) {
-    Vim_Text_Object_Result result = vim_text_object_exclusive(start_pos);
+    Vim_Text_Object_Result result = vim_text_object(start_pos);
 
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
     result.range = vim_search_once_internal(app, view, buffer, -vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
@@ -2889,9 +2906,8 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
 
     if (state->op_count > 0) {
         result = true;
-        // @TODO: Correct selections now that I got rid of inclusive
         if (state->selection.kind) {
-            result = vim_selection_consume_line(app, buffer, &state->selection, &range, false);
+            result = vim_selection_consume_line(app, buffer, &state->selection, &range, true);
             b32 trim_newlines = false;
             if (state->selection.kind == VimSelectionKind_Line) {
                 trim_newlines = HasFlag(flags, VimOpFlag_ChangeBehaviour);
@@ -2964,7 +2980,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                 result = false;
             }
         } else {
-            range = Ii64(view_get_cursor_pos(app, view));
+            range = Ii64_size(view_get_cursor_pos(app, view), 1); // @Unicode
         }
 
         if (result) {
@@ -3058,7 +3074,6 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
         } else {
             vim_enter_insert_mode(app);
         }
-        view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
     }
 }
 
@@ -3459,7 +3474,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
 
 internal void vim_align_internal(Application_Links* app, Vim_Operator_State* state, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
     if (selection.kind == VimSelectionKind_Block || selection.kind == VimSelectionKind_Line) {
-           String_Const_u8 align_target = vim_get_next_writable(app);
+        String_Const_u8 align_target = vim_get_next_writable(app);
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
         Range_i64 col_range  = Ii64(selection.range.first.col , selection.range.one_past_last.col );
         for (i32 i = 0; i < count; i++) {
@@ -3597,38 +3612,47 @@ internal void vim_toggle_line_comment_range(Application_Links* app, Buffer_ID bu
 }
 
 internal VIM_OPERATOR(vim_toggle_line_comment_no_indent_style) {
-    Vim_Comment_Style       style = VimCommentStyle_NoIndent;
+    Vim_Comment_Style style       = VimCommentStyle_NoIndent;
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
+
+    b32 comment_empty_lines = false; // @TODO: Expose to user
+
     if (selection.kind) {
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
     } else {
         i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
     }
 }
 
 internal VIM_OPERATOR(vim_toggle_line_comment_range_indent_style) {
-    Vim_Comment_Style       style = VimCommentStyle_RangeIndent;
+    Vim_Comment_Style style       = VimCommentStyle_RangeIndent;
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
+
+    b32 comment_empty_lines = false; // @TODO: Expose to user
+
     if (selection.kind) {
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
     } else {
         i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
     }
 }
 
 internal VIM_OPERATOR(vim_toggle_line_comment_full_indent_style) {
-    Vim_Comment_Style       style = VimCommentStyle_FullIndent;
+    Vim_Comment_Style style       = VimCommentStyle_FullIndent;
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
+
+    b32 comment_empty_lines = false; // @TODO: Expose to user
+
     if (selection.kind) {
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
     } else {
         i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, false, style, mode);
+        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
     }
 }
 
@@ -3736,7 +3760,7 @@ CUSTOM_COMMAND_SIG(vim_split_window_vertical) {
 }
 
 CUSTOM_COMMAND_SIG(vim_open_file_in_quotes_in_same_window)
-CUSTOM_DOC("Reads a filename from surrounding '\"' characters and attempts to open the corresponding file in the same window.")
+CUSTOM_DOC("[vim] Reads a filename from surrounding '\"' characters and attempts to open the corresponding file in the same window.")
 {
     View_ID view = get_active_view(app, Access_ReadVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
@@ -3765,7 +3789,7 @@ CUSTOM_DOC("Reads a filename from surrounding '\"' characters and attempts to op
 }
 
 CUSTOM_COMMAND_SIG(vim_undo)
-CUSTOM_DOC("Advances backwards through the undo history of the current buffer.")
+CUSTOM_DOC("[vim] Advances backwards through the undo history of the current buffer.")
 {
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
@@ -3783,7 +3807,7 @@ CUSTOM_DOC("Advances backwards through the undo history of the current buffer.")
 }
 
 CUSTOM_COMMAND_SIG(vim_redo)
-CUSTOM_DOC("Advances forwards through the undo history of the current buffer.")
+CUSTOM_DOC("[vim] Advances forwards through the undo history of the current buffer.")
 {
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
@@ -3900,7 +3924,7 @@ CUSTOM_COMMAND_SIG(vim_cycle_definitions_backward) {
 }
 
 CUSTOM_COMMAND_SIG(q)
-CUSTOM_DOC("Closes the current panel, or 4coder if this is the last panel.")
+CUSTOM_DOC("[vim] Closes the current panel, or 4coder if this is the last panel.")
 {
     View_ID view = get_active_view(app, Access_Always);
     View_ID first_view = get_view_next(app, 0, Access_Always);
@@ -3912,45 +3936,45 @@ CUSTOM_DOC("Closes the current panel, or 4coder if this is the last panel.")
 }
 
 CUSTOM_COMMAND_SIG(w)
-CUSTOM_DOC("Saves the current buffer.")
+CUSTOM_DOC("[vim] Saves the current buffer.")
 {
     save(app);
 }
 
 CUSTOM_COMMAND_SIG(wq)
-CUSTOM_DOC("Saves the current buffer and closes the current panel, or 4coder if this is the last panel.")
+CUSTOM_DOC("[vim] Saves the current buffer and closes the current panel, or 4coder if this is the last panel.")
 {
     save(app);
     q(app);
 }
 
 CUSTOM_COMMAND_SIG(qa)
-CUSTOM_DOC("Closes 4coder.")
+CUSTOM_DOC("[vim] Closes 4coder.")
 {
     exit_4coder(app);
 }
 
 CUSTOM_COMMAND_SIG(wqa)
-CUSTOM_DOC("Saves all buffers and closes 4coder.")
+CUSTOM_DOC("[vim] Saves all buffers and closes 4coder.")
 {
     save_all_dirty_buffers(app);
     qa(app);
 }
 
 CUSTOM_COMMAND_SIG(e)
-CUSTOM_DOC("Interactively open or create a new file.")
+CUSTOM_DOC("[vim] Interactively open or create a new file.")
 {
     interactive_open_or_new(app);
 }
 
 CUSTOM_COMMAND_SIG(b)
-CUSTOM_DOC("Interactively switch to an open buffer.")
+CUSTOM_DOC("[vim] Interactively switch to an open buffer.")
 {
     interactive_switch_buffer(app);
 }
 
 CUSTOM_COMMAND_SIG(ta)
-CUSTOM_DOC("Open jump-to-definition lister.")
+CUSTOM_DOC("[vim] Open jump-to-definition lister.")
 {
     jump_to_definition(app);
 }
@@ -3984,6 +4008,46 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence
     }
 
     return result;
+}
+
+CUSTOM_COMMAND_SIG(vim_start_mouse_select)
+CUSTOM_DOC("[vim] Sets the cursor position and mark to the mouse position and enters normal mode.")
+{
+    View_ID view = get_active_view(app, Access_ReadVisible);
+
+    Mouse_State mouse = get_mouse_state(app);
+    i64 pos = view_pos_from_xy(app, view, V2f32(mouse.p));
+
+    vim_enter_normal_mode(app);
+
+    view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
+    view_set_mark(app, view, seek_pos(pos));
+}
+
+CUSTOM_COMMAND_SIG(vim_mouse_drag)
+CUSTOM_DOC("[vim] If the mouse left button is pressed, sets the cursor position to the mouse position, and enables the preferred visual mode.")
+{
+    View_ID view = get_active_view(app, Access_ReadVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+    Managed_Scope scope = buffer_get_managed_scope(app, buffer);
+    Vim_Buffer_Attachment* vim_buffer = scope_attachment(app, scope, vim_buffer_attachment, Vim_Buffer_Attachment);
+
+    Mouse_State mouse = get_mouse_state(app);
+    if (mouse.l) {
+        i64 pos = view_pos_from_xy(app, view, V2f32(mouse.p));
+        i64 mark_pos = view_get_mark_pos(app, view);
+        if (pos != mark_pos) {
+            // @TODO: I shouldn't really need to check this, I should just add a parameter to not toggle the mode
+            if (!is_vim_visual_mode(vim_buffer->mode)) {
+                Assert(is_vim_visual_mode(glue(VimMode_, VIM_MOUSE_SELECT_MODE)));
+                vim_enter_mode(app, glue(VimMode_, VIM_MOUSE_SELECT_MODE));
+            }
+            view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
+        }
+    }
+
+    no_mark_snap_to_cursor(app, view);
 }
 
 #define vim_bind_motion(map, motion, key1, ...) vim_bind_motion_(map, motion, string_u8_litexpr(#motion), vim_key_sequence(key1, ##__VA_ARGS__))
@@ -4075,10 +4139,16 @@ internal void vim_unbind_(Vim_Binding_Map* map, Vim_Key_Sequence sequence) {
     }
 }
 
-#define VimInitializeMap(map, ...) vim_initialize_binding_map(app, &map, ##__VA_ARGS__)
+internal Vim_Binding_Map* vim_select_map_(Application_Links* app, Vim_Binding_Map* map) {
+    if (!map->initialized) {
+        vim_initialize_binding_map(app, map);
+    }
+    return map;
+}
+
 #define VimAddParentMap(parent) vim_add_parent_binding_map(vim_map, &vim_map->keybind_table, &(parent).keybind_table)
 #define VimMappingScope() Vim_Binding_Map* vim_map = 0
-#define VimSelectMap(map) vim_map = &(map)
+#define VimSelectMap(map) vim_map = vim_select_map_(app, &map)
 #define VimBind(cmd, key1, ...) vim_bind_(vim_map, cmd, string_u8_litexpr(#cmd), vim_key_sequence(key1, ##__VA_ARGS__))
 #define VimUnbind(key1, ...) vim_unbind_(vim_map, vim_key_sequence(key1, ##__VA_ARGS__))
 #define VimNameBind(description, key1, ...) vim_name_bind_(vim_map, description, vim_key_sequence(key1, ##__VA_ARGS__))
@@ -4249,7 +4319,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
 
     // NOTE(allen): Cursor shape
     Face_Metrics metrics = get_face_metrics(app, face_id);
-    f32 cursor_roundness = VIM_CURSOR_ROUNDNESS;
+    f32 cursor_roundness = (metrics.normal_advance*0.5f)*VIM_CURSOR_ROUNDNESS;
     f32 mark_thickness = 2.0f;
 
     Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
@@ -4600,7 +4670,7 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
 }
 
 CUSTOM_COMMAND_SIG(vim_default_view_handler)
-CUSTOM_DOC("Input consumption loop for vim view behavior")
+CUSTOM_DOC("[vim] Input consumption loop for view behavior")
 {
     Thread_Context *tctx = get_thread_context(app);
     Scratch_Block scratch(tctx);
@@ -4633,6 +4703,7 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
         }
 
         View_ID view = get_this_ctx_view(app, Access_Always);
+        Managed_Scope view_scope = view_get_managed_scope(app, view);
 
         Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
         Managed_Scope buffer_scope = buffer_get_managed_scope(app, buffer);
@@ -4654,16 +4725,20 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
             vim_state.command_start_pos = back_cursor.pos;
         }
 
-        i64 queried_number = vim_query_number(app, VimQuery_CurrentInput);
-        i32 op_count = cast(i32) clamp(1, queried_number, max_i32);
-        b32 op_count_was_set = (queried_number != 0);
+        vim_state.capture_queries_into_chord_bar = true;
+
+        i32 op_count = 1;
+        b32 op_count_was_set = false;
+        if (!is_vim_insert_mode(vim_buffer->mode)) {
+            i64 queried_number = vim_query_number(app, VimQuery_CurrentInput);
+            op_count = cast(i32) clamp(1, queried_number, max_i32);
+            op_count_was_set = (queried_number != 0);
+        }
 
         Vim_Key_Binding* vim_bind = 0;
         if (map && map->initialized) {
             vim_bind = vim_query_binding(app, map, 0, VimQuery_CurrentInput);
         }
-
-        Managed_Scope scope = view_get_managed_scope(app, view);
 
         if (!binding.custom && !vim_bind) {
             // NOTE(allen): we don't have anything to do with this input,
@@ -4672,7 +4747,7 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
             leave_current_input_unhandled(app);
         } else {
             // NOTE(allen): before the command is called do some book keeping
-            Rewrite_Type *next_rewrite = scope_attachment(app, scope, view_next_rewrite_loc, Rewrite_Type);
+            Rewrite_Type *next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
             *next_rewrite = Rewrite_None;
             if (fcoder_mode == FCoderMode_NotepadLike) {
                 for (View_ID view_it = get_view_next(app, 0, Access_Always);
@@ -4688,8 +4763,6 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
             ProfileCloseNow(view_input_profile);
 
             if (vim_bind) {
-                vim_state.capture_queries_into_chord_bar = true;
-
                 if (vim_bind) {
                     Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
 
@@ -4716,16 +4789,20 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
                     switch (vim_bind->kind) {
                         case VimBindingKind_Motion: {
                             vim_state.character_seek_show_highlight = false;
-                            i64 old_pos = view_get_cursor_pos(app, view);
-                            Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, vim_bind->motion, old_pos, op_count, op_count_was_set);
+
+                            Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, vim_bind->motion, view_get_cursor_pos(app, view), op_count, op_count_was_set);
                             vim_seek_motion_result(app, view, buffer, mr);
+
                             if (HasFlag(mr.flags, VimMotionFlag_SetPreferredX)) {
                                 vim_buffer->visual_block_force_to_line_end = HasFlag(mr.flags, VimMotionFlag_VisualBlockForceToLineEnd);
                             }
                         } break;
 
                         case VimBindingKind_TextObject: {
+                            vim_state.character_seek_show_highlight = false;
+
                             Vim_Text_Object_Result tor = vim_execute_text_object(app, view, buffer, vim_bind->text_object, view_get_cursor_pos(app, view), op_count, op_count_was_set);
+
                             Vim_Mode new_mode = VimMode_Visual;
                             if (tor.style == VimRangeStyle_Linewise) {
                                 new_mode = VimMode_VisualLine;
@@ -4734,6 +4811,7 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
                             if (vim_buffer->mode != new_mode) {
                                 vim_enter_mode(app, new_mode);
                             }
+
                             vim_select_range(app, view, tor.range);
                         } break;
 
@@ -4785,9 +4863,9 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
             // NOTE(allen): after the command is called do some book keeping
             ProfileScope(app, "after view input");
 
-            next_rewrite = scope_attachment(app, scope, view_next_rewrite_loc, Rewrite_Type);
+            next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
             if (next_rewrite != 0) {
-                Rewrite_Type *rewrite = scope_attachment(app, scope, view_rewrite_loc, Rewrite_Type);
+                Rewrite_Type *rewrite = scope_attachment(app, view_scope, view_rewrite_loc, Rewrite_Type);
                 *rewrite = *next_rewrite;
                 if (fcoder_mode == FCoderMode_NotepadLike) {
                     for (View_ID view_it = get_view_next(app, 0, Access_Always);
@@ -5017,10 +5095,10 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     SelectMap(vim_mapid_normal);
     ParentMap(mapid_global);
 
-    BindMouse(click_set_cursor_and_mark, MouseCode_Left);
+    BindMouse(vim_start_mouse_select, MouseCode_Left);
     BindMouseRelease(click_set_cursor, MouseCode_Left);
     BindCore(click_set_cursor_and_mark, CoreCode_ClickActivateView);
-    BindMouseMove(click_set_cursor_if_lbutton);
+    BindMouseMove(vim_mouse_drag);
 
     //
     // Visual Map
@@ -5039,7 +5117,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     // Text Object Vim Map
     //
 
-    VimInitializeMap(vim_map_text_objects);
     VimSelectMap(vim_map_text_objects);
 
     VimBind(vim_text_object_inner_scope,                         vim_char('i'), vim_char('{'));
@@ -5056,7 +5133,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     // Operator Pending Vim Map
     //
 
-    VimInitializeMap(vim_map_operator_pending);
     VimSelectMap(vim_map_operator_pending);
     VimAddParentMap(vim_map_text_objects);
 
@@ -5100,7 +5176,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     // Normal Vim Map
     //
 
-    VimInitializeMap(vim_map_normal);
     VimSelectMap(vim_map_normal);
     VimAddParentMap(vim_map_operator_pending);
 
@@ -5226,7 +5301,6 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     // Visual Vim Map
     //
 
-    VimInitializeMap(vim_map_visual);
     VimSelectMap(vim_map_visual);
     VimAddParentMap(vim_map_normal);
     VimAddParentMap(vim_map_text_objects);
