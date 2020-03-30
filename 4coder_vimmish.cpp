@@ -645,8 +645,32 @@ typedef VIM_MOTION(Vim_Motion);
 #define VIM_TEXT_OBJECT(name) Vim_Text_Object_Result name(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, i32 motion_count, b32 motion_count_was_set)
 typedef VIM_TEXT_OBJECT(Vim_Text_Object);
 
-#define VIM_OPERATOR(name) void name(Application_Links* app, struct Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 count_was_set)
+enum Vim_Operator_Flag {
+    VimOpFlag_QueryMotion     = 0x1,
+    VimOpFlag_ChangeBehaviour = 0x2,
+    VimOpFlag_DeleteBehaviour = 0x4,
+};
+
+#define VIM_OPERATOR(name) void name(Application_Links* app, struct Vim_Operator_State* state, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 count_was_set)
 typedef VIM_OPERATOR(Vim_Operator);
+
+struct Vim_Operator_State {
+    Application_Links* app;
+
+    View_ID view;
+    Buffer_ID buffer;
+
+    i32 op_count;
+    Vim_Operator* op;
+
+    i32 motion_count;
+    b32 motion_count_was_set;
+    Vim_Motion* motion;
+    Vim_Text_Object* text_object;
+
+    Vim_Visual_Selection selection;
+    Range_i64 total_range;
+};
 
 enum Vim_Modifier {
     VimModifier_Control = 0x1,
@@ -2854,48 +2878,8 @@ internal VIM_MOTION(vim_motion_page_bottom) {
     return result;
 }
 
-enum Vim_Operator_State_Flag {
-    VimOpFlag_QueryMotion     = 0x1,
-    VimOpFlag_ChangeBehaviour = 0x2,
-    VimOpFlag_DeleteBehaviour = 0x4,
-};
-
-struct Vim_Operator_State {
-    Application_Links* app;
-
-    View_ID view;
-    Buffer_ID buffer;
-
-    i32 op_count;
-    Vim_Operator* op;
-
-    i32 motion_count;
-    b32 motion_count_was_set;
-    Vim_Motion* motion;
-    Vim_Text_Object* text_object;
-
-    Vim_Visual_Selection selection;
-    Range_i64 total_range;
-
-    u32 flags;
-};
-
-#define vim_build_op_state(op, flags) vim_build_op_state_(app, view, buffer, count, op, selection, flags)
-internal Vim_Operator_State vim_build_op_state_(Application_Links* app, View_ID view, Buffer_ID buffer, i32 op_count, Vim_Operator* op, Vim_Visual_Selection selection, u32 flags) {
-    Vim_Operator_State result = {};
-    result.app          = app;
-    result.view         = view;
-    result.buffer       = buffer;
-    result.op_count     = Min(op_count, VIM_MAXIMUM_OP_COUNT);
-    result.op           = op;
-    result.motion_count = 1;
-    result.selection    = selection;
-    result.total_range  = Ii64_neg_inf;
-    result.flags        = flags;
-    return result;
-}
-
-internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_range) {
+// @TODO: Instead of calling this in operators, have it passed, and just pass your flags to vim_get_operator_range.
+internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_range, u32 flags = 0) {
     Application_Links* app = state->app;
     View_ID view = state->view;
     Buffer_ID buffer = state->buffer;
@@ -2910,7 +2894,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
             result = vim_selection_consume_line(app, buffer, &state->selection, &range, false);
             b32 trim_newlines = false;
             if (state->selection.kind == VimSelectionKind_Line) {
-                trim_newlines = HasFlag(state->flags, VimOpFlag_ChangeBehaviour);
+                trim_newlines = HasFlag(flags, VimOpFlag_ChangeBehaviour);
             } else if (state->selection.kind == VimSelectionKind_Block) {
                 trim_newlines = true;
                 if (result) {
@@ -2922,7 +2906,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                     range.max = view_set_pos_by_character_delta(app, view, range.max, -1);
                 }
             }
-        } else if (HasFlag(state->flags, VimOpFlag_QueryMotion)) {
+        } else if (HasFlag(flags, VimOpFlag_QueryMotion)) {
             if (!state->motion && !state->text_object) {
                 i64 count_query = vim_query_number(app, VimQuery_NextInput);
                 state->motion_count = cast(i32) clamp(1, count_query, VIM_MAXIMUM_OP_COUNT);
@@ -2941,7 +2925,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
             }
 
             if (state->motion) {
-                if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
+                if (HasFlag(flags, VimOpFlag_ChangeBehaviour)) {
                     // Note: Vim's behaviour is a little inconsistent with some motions wnen using the change operator for the sake of intuitiveness.
                     if      (state->motion == vim_motion_word)               state->motion = vim_motion_word_end;
                     else if (state->motion == vim_motion_to_empty_line_up)   state->motion = vim_motion_prior_to_empty_line_up;
@@ -2959,12 +2943,12 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                     vim_seek_motion_result(app, view, buffer, mr);
                 }
             } else if (state->text_object) {
-                if (HasFlag(state->flags, VimOpFlag_DeleteBehaviour)) {
+                if (HasFlag(flags, VimOpFlag_DeleteBehaviour)) {
                     if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_delete;
                     else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_delete;
                 }
 
-                if (HasFlag(state->flags, VimOpFlag_ChangeBehaviour)) {
+                if (HasFlag(flags, VimOpFlag_ChangeBehaviour)) {
                     if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_change;
                     else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_change;
                 }
@@ -3006,7 +2990,7 @@ enum Vim_DCY {
     VimDCY_Yank,
 };
 
-internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, b32 query_motion, Vim_Motion* motion = 0) {
+internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_State* state, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, Vim_DCY mode, Vim_Operator* op, b32 query_motion, Vim_Motion* motion = 0) {
     // @TODO: This whole function is weird and stupid...
     Managed_Scope scope = buffer_get_managed_scope(app, buffer);
     Line_Ending_Kind* eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
@@ -3024,9 +3008,8 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Map*
     Scratch_Block scratch(app);
     List_String_Const_u8 yank_string_list = {};
 
-    Vim_Operator_State state = vim_build_op_state(op, op_flags);
-    state.motion = motion;
-    while (vim_get_operator_range(&state, &range)) {
+    state->motion = motion;
+    while (vim_get_operator_range(state, &range, op_flags)) {
         Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
 
         if (!did_act && range_size(range) > 0) {
@@ -3075,48 +3058,47 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Binding_Map*
         } else {
             vim_enter_insert_mode(app);
         }
-        view_set_cursor_and_preferred_x(app, view, seek_pos(state.total_range.min));
+        view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
     }
 }
 
 internal VIM_OPERATOR(vim_delete) {
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete, true);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Delete, vim_delete, true);
 }
 
 internal VIM_OPERATOR(vim_delete_character) {
     // @TODO: At the end of the line, this will delete the newline rather than step back and delete the last character on the line, contrary to vim's behaviour.
     //        It's a little annoying, so I want to make sure to get it consistent with him.
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Delete, vim_delete_character, false);
 }
 
 internal VIM_OPERATOR(vim_change) {
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Change, vim_change, true);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Change, vim_change, true);
 }
 
 internal VIM_OPERATOR(vim_yank) {
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Yank, vim_yank, true);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Yank, vim_yank, true);
 }
 
 internal VIM_OPERATOR(vim_delete_eol) {
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Delete, vim_delete, false, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Delete, vim_delete, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_change_eol) {
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Change, vim_change, false, vim_motion_line_end_textual);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Change, vim_change, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_yank_eol) {
     // NOTE: This is vim's default behaviour (cuz it's vi compatible)
-    // vim_delete_change_or_yank(app, map, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
-    vim_delete_change_or_yank(app, map, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
+    // vim_delete_change_or_yank(app, state, view, buffer, selection, count, vim_yank, false, vim_motion_enclose_line_textual);
+    vim_delete_change_or_yank(app, state, view, buffer, selection, count, VimDCY_Yank, vim_yank, false, vim_motion_line_end_textual);
 }
 
 internal VIM_OPERATOR(vim_replace) {
     String_Const_u8 replace_char = vim_get_next_writable(app);
 
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_replace, 0);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range)) {
         for (i64 replace_cursor = range.min; replace_cursor < range.max; replace_cursor++) {
             buffer_replace_range(app, buffer, Ii64(replace_cursor, view_set_pos_by_character_delta(app, view, replace_cursor, 1)), replace_char);
         }
@@ -3292,8 +3274,7 @@ internal VIM_OPERATOR(vim_paste_pre_cursor) {
 
 internal VIM_OPERATOR(vim_lowercase) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_lowercase, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
         Scratch_Block scratch(app);
         String_Const_u8 string = push_buffer_range(app, scratch, buffer, range);
 
@@ -3305,8 +3286,7 @@ internal VIM_OPERATOR(vim_lowercase) {
 
 internal VIM_OPERATOR(vim_uppercase) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_uppercase, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
         Scratch_Block scratch(app);
         String_Const_u8 string = push_buffer_range(app, scratch, buffer, range);
 
@@ -3318,8 +3298,7 @@ internal VIM_OPERATOR(vim_uppercase) {
 
 internal VIM_OPERATOR(vim_auto_indent) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_auto_indent, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
         auto_indent_buffer(app, buffer, range);
     }
 }
@@ -3358,8 +3337,7 @@ internal void vim_shift_indentation_of_line(Application_Links* app, Buffer_ID bu
 
 internal VIM_OPERATOR(vim_indent) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_indent, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
         Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
         if (line_range.min == line_range.max) {
             line_range.max++;
@@ -3372,8 +3350,7 @@ internal VIM_OPERATOR(vim_indent) {
 
 internal VIM_OPERATOR(vim_outdent) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_outdent, VimOpFlag_QueryMotion);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
         Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
         if (line_range.min == line_range.max) {
             line_range.max++;
@@ -3480,7 +3457,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
     return did_align;
 }
 
-internal void vim_align_internal(Application_Links* app, Vim_Binding_Map* map, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
+internal void vim_align_internal(Application_Links* app, Vim_Operator_State* state, View_ID view, Buffer_ID buffer, Vim_Visual_Selection selection, i32 count, b32 align_right) {
     if (selection.kind == VimSelectionKind_Block || selection.kind == VimSelectionKind_Line) {
            String_Const_u8 align_target = vim_get_next_writable(app);
         Range_i64 line_range = Ii64(selection.range.first.line, selection.range.one_past_last.line);
@@ -3491,8 +3468,7 @@ internal void vim_align_internal(Application_Links* app, Vim_Binding_Map* map, V
     } else {
         String_Const_u8 align_target = SCu8();
         Range_i64 range = {};
-        Vim_Operator_State state = vim_build_op_state(vim_lowercase, VimOpFlag_QueryMotion);
-        while (vim_get_operator_range(&state, &range)) {
+        while (vim_get_operator_range(state, &range, VimOpFlag_QueryMotion)) {
             if (!align_target.size) {
                 align_target = vim_get_next_writable(app);
             }
@@ -3504,11 +3480,11 @@ internal void vim_align_internal(Application_Links* app, Vim_Binding_Map* map, V
 }
 
 internal VIM_OPERATOR(vim_align) {
-    vim_align_internal(app, map, view, buffer, selection, count, false);
+    vim_align_internal(app, state, view, buffer, selection, count, false);
 }
 
 internal VIM_OPERATOR(vim_align_right) {
-    vim_align_internal(app, map, view, buffer, selection, count, true);
+    vim_align_internal(app, state, view, buffer, selection, count, true);
 }
 
 internal VIM_OPERATOR(vim_new_line_below) {
@@ -3669,8 +3645,7 @@ internal void vim_join_line_internal(Application_Links* app, Buffer_ID buffer, i
 internal VIM_OPERATOR(vim_join_line) {
     if (selection.kind) {
         Range_i64 range = {};
-        Vim_Operator_State state = vim_build_op_state(vim_join_line, 0);
-        while (vim_get_operator_range(&state, &range)) {
+        while (vim_get_operator_range(state, &range)) {
             Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
             for (i64 line_index = 0; line_index < Max(1, range_size(line_range) - 1); line_index++) {
                 vim_join_line_internal(app, buffer, line_range.min);
@@ -3699,16 +3674,14 @@ internal void vim_miblo_internal(Application_Links* app, Buffer_ID buffer, Range
 
 internal VIM_OPERATOR(vim_miblo_increment) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_miblo_increment, 0);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range)) {
         vim_miblo_internal(app, buffer, range, 1);
     }
 }
 
 internal VIM_OPERATOR(vim_miblo_decrement) {
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_miblo_decrement, 0);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range)) {
         vim_miblo_internal(app, buffer, range, -1);
     }
 }
@@ -3716,8 +3689,7 @@ internal VIM_OPERATOR(vim_miblo_decrement) {
 internal VIM_OPERATOR(vim_miblo_increment_sequence) {
     i64 delta = 1;
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_miblo_increment_sequence, 0);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range)) {
         vim_miblo_internal(app, buffer, range, delta++);
     }
 }
@@ -3725,8 +3697,7 @@ internal VIM_OPERATOR(vim_miblo_increment_sequence) {
 internal VIM_OPERATOR(vim_miblo_decrement_sequence) {
     i64 delta = -1;
     Range_i64 range = {};
-    Vim_Operator_State state = vim_build_op_state(vim_miblo_decrement_sequence, 0);
-    while (vim_get_operator_range(&state, &range)) {
+    while (vim_get_operator_range(state, &range)) {
         vim_miblo_internal(app, buffer, range, delta--);
     }
 }
@@ -4767,12 +4738,19 @@ CUSTOM_DOC("Input consumption loop for vim view behavior")
                         } break;
 
                         case VimBindingKind_Operator: {
-                            // vim_set_selection(app, view, selection); // @VisualRepeat
-                            vim_bind->op(app, map, view, buffer, selection, op_count, op_count_was_set);
+                            Vim_Operator_State op_state = {};
+                            op_state.app          = app;
+                            op_state.view         = view;
+                            op_state.buffer       = buffer;
+                            op_state.op_count     = op_count;
+                            op_state.op           = vim_bind->op;
+                            op_state.motion_count = 1;
+                            op_state.selection    = selection;
+
+                            vim_bind->op(app, &op_state, view, buffer, selection, op_count, op_count_was_set);
                         } break;
 
                         case VimBindingKind_4CoderCommand: {
-                            // vim_set_selection(app, view, selection); // @VisualRepeat
                             for (i32 i = 0; i < Min(op_count, VIM_MAXIMUM_OP_COUNT); i++) {
                                 vim_bind->fcoder_command(app);
                             }
