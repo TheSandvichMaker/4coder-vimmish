@@ -26,5 +26,5 @@ void custom_layer_init(Application_Links *app) {
     vim_set_default_hooks(app);
     vim_setup_default_mapping(app, &framework_mapping, vim_key(KeyCode_Space));
 
-    vim_add_alias("breka", "break");
+    vim_add_abbreviation("breka", "break");
 }
