@@ -546,50 +546,6 @@ struct Vim_Global_State {
 
 global Vim_Global_State vim_state;
 
-CUSTOM_COMMAND_SIG(vim_repeat_command) {
-    View_ID view = get_active_view(app, Access_ReadWriteVisible);
-    View_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
-    
-    if (!buffer_exists(app, buffer)) return;
-    
-    Vim_Command_Rep* rep = &vim_state.command_rep;
-
-    switch (rep->kind) {
-        case VimCommandRep_Operator: {
-            Vim_Operator_State op_state = {};
-            op_state.app          = app;
-            op_state.view         = view;
-            op_state.buffer       = buffer;
-            op_state.op_count     = rep->count;
-            op_state.op           = rep->op;
-            op_state.motion_count = rep->motion_count;
-            op_state.motion       = rep->motion;
-            op_state.selection    = rep->selection;
-            op_state.total_range  = Ii64_neg_inf;
-
-            vim_state.active_register = rep->reg;
-            rep->op(app, &op_state, view, buffer, rep->selection, rep->count, rep->count_was_set);
-            vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
-        } break;
-        
-        case VimCommandRep_FCoderCommand: {
-            for (i32 i = 0; i < Min(rep->count, VIM_MAXIMUM_OP_COUNT); i++) {
-                rep->fcoder_command(app);
-            }
-        } break;
-    }
-
-    if (vim_state.mode == VimMode_Insert) {
-        Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
-        for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
-            i64 col = cursor.col + node->rel_col;
-            Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(cursor.line, col));
-            Range_i64 replace_range = Ii64_size(insert_cursor.pos, node->text_backward.size);
-            buffer_replace_range(app, buffer, replace_range, node->text_forward);
-        }
-    }
-}
-
 #define vim_add_abbreviation(match, replacement) vim_add_abbreviation_(string_u8_litexpr(match), string_u8_litexpr(replacement))
 internal void vim_add_abbreviation_(String_Const_u8 match, String_Const_u8 replacement) {
     Vim_Abbreviation* abbreviation = push_array(&vim_state.arena, Vim_Abbreviation, 1);
@@ -1671,6 +1627,10 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
     }
 
     vim_state.mode = mode;
+}
+
+CUSTOM_COMMAND_SIG(vim_enter_normal_mode_escape) {
+    vim_enter_mode(app, VimMode_Normal, false);
 }
 
 CUSTOM_COMMAND_SIG(vim_enter_normal_mode) {
@@ -3767,6 +3727,51 @@ internal VIM_OPERATOR(vim_miblo_decrement_sequence) {
     }
 }
 
+CUSTOM_COMMAND_SIG(vim_repeat_command) {
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    View_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+    
+    if (!buffer_exists(app, buffer)) return;
+    
+    Vim_Command_Rep* rep = &vim_state.command_rep;
+
+    switch (rep->kind) {
+        case VimCommandRep_Operator: {
+            Vim_Operator_State op_state = {};
+            op_state.app          = app;
+            op_state.view         = view;
+            op_state.buffer       = buffer;
+            op_state.op_count     = rep->count;
+            op_state.op           = rep->op;
+            op_state.motion_count = rep->motion_count;
+            op_state.motion       = rep->motion;
+            op_state.selection    = rep->selection;
+            op_state.total_range  = Ii64_neg_inf;
+
+            vim_state.active_register = rep->reg;
+            rep->op(app, &op_state, view, buffer, rep->selection, rep->count, rep->count_was_set);
+            vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
+        } break;
+        
+        case VimCommandRep_FCoderCommand: {
+            for (i32 i = 0; i < Min(rep->count, VIM_MAXIMUM_OP_COUNT); i++) {
+                rep->fcoder_command(app);
+            }
+        } break;
+    }
+
+    if (vim_state.mode == VimMode_Insert) {
+        Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
+        for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
+            i64 col = cursor.col + node->rel_col;
+            Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(cursor.line, col));
+            Range_i64 replace_range = Ii64_size(insert_cursor.pos, node->text_backward.size);
+            buffer_replace_range(app, buffer, replace_range, node->text_forward);
+        }
+        vim_enter_normal_mode(app);
+    }
+}
+
 internal b32 vim_split_window_internal(Application_Links* app, View_ID view, Dimension dim) {
     b32 result = false;
 
@@ -5290,7 +5295,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     
     VimBind(vim_toggle_line_comment_range_indent_style,          vim_leader, vim_char('c'), vim_key(KeyCode_Space));
 
-    VimBind(vim_enter_normal_mode,                               vim_key(KeyCode_Escape));
+    VimBind(vim_enter_normal_mode_escape,                        vim_key(KeyCode_Escape));
     VimBind(vim_isearch_word_under_cursor,                       vim_char('*'));
     VimBind(vim_reverse_isearch_word_under_cursor,               vim_char('#'));
     VimBind(vim_repeat_command,                                  vim_char('.'));
