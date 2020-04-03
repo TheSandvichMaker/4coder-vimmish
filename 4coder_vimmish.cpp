@@ -120,6 +120,10 @@
 // - Review what should go into the view attachment versus the buffer attachment versus the global state.
 // - Check why visual line range delete on blank lines isn't inclusive
 // - Make it possible to set the register for a command again
+// - Investigate: Next search gets caught on push_render_element in handmade_render_group.cpp
+// - Make character highlights turn off in insert mode (after a change + seek motion)
+// - Check whether the cursor should end up at the end of a paste
+// - Visual Block forced to line end produces ranges that are one character short
 
 //
 // Internal Defines
@@ -710,6 +714,7 @@ internal void vim_log_jump_history(Application_Links* app) {
 
 CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
     View_ID view = get_active_view(app, Access_Always);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
     Managed_Scope scope = view_get_managed_scope(app, view);
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
@@ -724,7 +729,9 @@ CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
     if (vim_view->jump_history_cursor > vim_view->jump_history_min) {
         Tiny_Jump jump = ArraySafe(vim_view->jump_history, --vim_view->jump_history_cursor);
         jump_to_location(app, view, jump.buffer, jump.pos);
-        vim_view->dont_log_this_buffer_jump = true;
+        if (jump.buffer == buffer) {
+            vim_view->dont_log_this_buffer_jump = true;
+        }
     }
 }
 
@@ -2201,34 +2208,36 @@ internal Vim_Text_Object_Result vim_text_object_inner_nest_internal(Application_
     // @TODO: Turn this function into not a total hot mess
     Vim_Text_Object_Result result = vim_text_object(start_pos);
 
-    if (vim_find_surrounding_nest(app, buffer, start_pos, flags, &result.range, true)) {
+    if (find_surrounding_nest(app, buffer, start_pos, flags, &result.range)) {
         i64 min = result.range.min;
         i64 max = result.range.max;
+        i64 min_inner = result.range.min + 1; // @Incomplete: This must be the opening token's size!!!
+        i64 max_inner = result.range.max - 1;
         i64 min_line = get_line_number_from_pos(app, buffer, min);
         i64 max_line = get_line_number_from_pos(app, buffer, max);
+        result.range = Ii64(min_inner, max_inner);
         if (min_line != max_line) {
             Scratch_Block scratch(app);
-            String_Const_u8 left_of_max = push_buffer_range(app, scratch, buffer, Ii64(get_line_start_pos(app, buffer, max_line), max));
-            if (string_find_first_non_whitespace(left_of_max) == left_of_max.size) {
-                max = get_line_end_pos(app, buffer, max_line - 1);
+            String_Const_u8 left_of_max = push_buffer_range(app, scratch, buffer, Ii64(get_line_start_pos(app, buffer, max_line), max_inner));
+            if (!leave_inner_line && (!left_of_max.size || string_find_first_non_whitespace(left_of_max) == left_of_max.size)) {
+                result.range.max = get_line_start_pos(app, buffer, max_line);
             }
             if ((max_line - 1) > min_line) {
                 if (select_inner_block) {
-                    min = get_line_start_pos(app, buffer, min_line + 1);
+                    result.range.min = get_line_start_pos(app, buffer, min_line + 1);
                 } else if (leave_inner_line) {
-                    min = get_pos_past_lead_whitespace_from_line_number(app, buffer, min_line + 1);
+                    result.range.min = get_pos_past_lead_whitespace_from_line_number(app, buffer, min_line + 1);
                 }
             }
         }
-        result.range = Ii64(min, max);
     }
 
     return result;
 }
 
-internal VIM_TEXT_OBJECT(vim_text_object_inner_scope_change) {
-    return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, true, false);
-}
+// internal VIM_TEXT_OBJECT(vim_text_object_inner_scope_change) {
+//     return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, true, false);
+// }
 
 internal VIM_TEXT_OBJECT(vim_text_object_inner_scope_delete) {
     return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, false, false);
@@ -2238,9 +2247,9 @@ internal VIM_TEXT_OBJECT(vim_text_object_inner_scope) {
     return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Scope, false, true);
 }
 
-internal VIM_TEXT_OBJECT(vim_text_object_inner_paren_change) {
-    return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true, false);
-}
+// internal VIM_TEXT_OBJECT(vim_text_object_inner_paren_change) {
+//     return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true, false);
+// }
 
 internal VIM_TEXT_OBJECT(vim_text_object_inner_paren_delete) {
     return vim_text_object_inner_nest_internal(app, view, buffer, start_pos, FindNest_Paren, true, false);
@@ -2960,8 +2969,10 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                 }
 
                 if (HasFlag(flags, VimOpFlag_ChangeBehaviour)) {
-                    if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_change;
-                    else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_change;
+                    // if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_change;
+                    // else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_change;
+                    if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_delete;
+                    else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_delete;
                     else if (state->text_object == vim_text_object_line)        state->text_object = vim_text_object_inner_line;
                 }
 
@@ -3068,6 +3079,13 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
         if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
             vim_enter_visual_insert_mode(app);
         } else {
+            if (state->text_object == vim_text_object_inner_scope_delete || 
+                state->text_object == vim_text_object_inner_paren_delete)
+            {
+                view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
+                vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+            }
+
             vim_enter_insert_mode(app);
         }
     }
@@ -3261,11 +3279,11 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
 
             String_Const_u8 replaced_string = push_buffer_range(app, scratch, buffer, replace_range);
             buffer_replace_range(app, buffer, replace_range, paste_string);
+            view_set_cursor_and_preferred_x(app, view, seek_pos(replace_range.min + paste_string.size - 1)); // @Unicode
 #if VIM_AUTO_INDENT_ON_PASTE
             auto_indent_buffer(app, buffer, Ii64_size(cursor.pos, paste_string.size));
 #endif
-            move_past_lead_whitespace(app, view, buffer);
-
+            
             if (replaced_string.size) {
                 vim_write_register(app, vim_state.active_register, replaced_string);
             }
@@ -3955,14 +3973,18 @@ CUSTOM_COMMAND_SIG(vim_jump_to_definition_under_cursor) {
     }
 }
 
-CUSTOM_COMMAND_SIG(vim_cycle_definitions_forward) {
+CUSTOM_COMMAND_SIG(vim_cycle_definitions_forward)
+CUSTOM_DOC("Jump to next definition")
+{
     View_ID view = get_active_view(app, Access_ReadVisible);
     Tiny_Jump jump = vim_state.definition_stack[++vim_state.definition_stack_cursor % vim_state.definition_stack_count];
     vim_log_jump_history(app);
     jump_to_location(app, view, jump.buffer, jump.pos);
 }
 
-CUSTOM_COMMAND_SIG(vim_cycle_definitions_backward) {
+CUSTOM_COMMAND_SIG(vim_cycle_definitions_backward)
+CUSTOM_DOC("Jump to previous definition")
+{
     View_ID view = get_active_view(app, Access_ReadVisible);
     Tiny_Jump jump = vim_state.definition_stack[--vim_state.definition_stack_cursor % vim_state.definition_stack_count];
     vim_log_jump_history(app);
@@ -5281,7 +5303,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_open_file_in_quotes_in_same_window,              vim_char('g'), vim_char('f'));
     VimBind(vim_jump_to_definition_under_cursor,                 vim_char(']', KeyCode_Control));
 
-    VimNameBind(string_u8_litexpr("Files"),                      vim_leader, vim_key(KeyCode_F));
+    VimNameBind(string_u8_litexpr("Files"),                      vim_leader, vim_char('f'));
     VimBind(interactive_open_or_new,                             vim_leader, vim_char('f'), vim_char('e'));
     VimBind(interactive_switch_buffer,                           vim_leader, vim_char('f'), vim_char('b'));
     VimBind(interactive_kill_buffer,                             vim_leader, vim_char('f'), vim_char('k'));
@@ -5290,8 +5312,11 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(qa,                                                  vim_leader, vim_char('f'), vim_char('Q'));
     VimBind(save,                                                vim_leader, vim_char('f'), vim_char('w'));
     
-    VimNameBind(string_u8_litexpr("Search"),                     vim_leader, vim_key(KeyCode_S));
+    VimNameBind(string_u8_litexpr("Search"),                     vim_leader, vim_char('s'));
     VimBind(list_all_substring_locations_case_insensitive,       vim_leader, vim_char('s'), vim_char('s'));
+    
+    VimNameBind(string_u8_litexpr("Tags"),                       vim_leader, vim_char('t'));
+    VimBind(jump_to_definition,                                  vim_leader, vim_char('t'), vim_char('a'));
     
     VimBind(vim_toggle_line_comment_range_indent_style,          vim_leader, vim_char('c'), vim_key(KeyCode_Space));
 
