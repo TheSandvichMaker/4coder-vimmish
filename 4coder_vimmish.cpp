@@ -1334,6 +1334,34 @@ CUSTOM_COMMAND_SIG(vim_replay_macro) {
     }
 }
 
+CUSTOM_COMMAND_SIG(vim_view_move_line_to_top)
+CUSTOM_DOC("[vim] move current line to the top of the view") {
+    View_ID view = get_active_view(app, Access_ReadVisible);
+
+    i64 pos = view_get_cursor_pos(app, view);
+    Buffer_Cursor cursor = view_compute_cursor(app, view, seek_pos(pos));
+
+    Buffer_Scroll scroll = view_get_buffer_scroll(app, view);
+    scroll.target.line_number = cursor.line;
+    scroll.target.pixel_shift.y = 0.f;
+    view_set_buffer_scroll(app, view, scroll, SetBufferScroll_NoCursorChange);
+}
+
+CUSTOM_COMMAND_SIG(vim_view_move_line_to_bottom)
+CUSTOM_DOC("[vim] move current line to the bottom of the view") {
+    View_ID view = get_active_view(app, Access_ReadVisible);
+
+    Rect_f32 region = view_get_buffer_region(app, view);
+
+    i64 pos = view_get_cursor_pos(app, view);
+    Buffer_Cursor cursor = view_compute_cursor(app, view, seek_pos(pos));
+
+    Buffer_Scroll scroll = view_get_buffer_scroll(app, view);
+    scroll.target.line_number = cursor.line - 1;
+    scroll.target.pixel_shift.y = -region.p1.y;
+    view_set_buffer_scroll(app, view, scroll, SetBufferScroll_NoCursorChange);
+}
+
 CUSTOM_COMMAND_SIG(vim_set_mark) {
     // @TODO: From :help marks
     // "Lowercase marks are restored when using undo and redo."
@@ -2875,47 +2903,50 @@ internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_backward) {
 
 internal VIM_MOTION(vim_motion_page_top) {
     Vim_Motion_Result result = vim_motion_linewise(start_pos);
-    result.flags |= VimMotionFlag_SetPreferredX;
 
-    Buffer_Cursor start_cursor = buffer_compute_cursor(app, buffer, seek_pos(start_pos));
+    i64 pos = view_get_cursor_pos(app, view);
+    Buffer_Cursor start_cursor = view_compute_cursor(app, view, seek_pos(pos));
 
-    Rect_f32 region = view_get_buffer_region(app, view);
-    // @TODO: This shouldn't be proportional, just step back one line height
-    region.y0 = region.y1 - cast(i32) (0.95f*(cast(f32) rect_height(region)));
-    Buffer_Cursor seek_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_pos_from_xy(app, view, region.p0)));
+    Buffer_Scroll scroll = view_get_buffer_scroll(app, view);
 
-    result.seek_pos = buffer_compute_cursor(app, buffer, seek_line_col(seek_cursor.line, start_cursor.col)).pos;
+    i64 line = scroll.position.line_number;
+    Buffer_Cursor target_cursor = view_compute_cursor(app, view, seek_line_col(line, start_cursor.col));
 
+    result.seek_pos = target_cursor.pos;
     return result;
 }
-
+                   
 internal VIM_MOTION(vim_motion_page_mid) {
     Vim_Motion_Result result = vim_motion_linewise(start_pos);
-    result.flags |= VimMotionFlag_SetPreferredX;
 
-    Buffer_Cursor start_cursor = buffer_compute_cursor(app, buffer, seek_pos(start_pos));
+    i64 pos = view_get_cursor_pos(app, view);
+    Buffer_Cursor cursor = view_compute_cursor(app, view, seek_pos(pos));
 
     Rect_f32 region = view_get_buffer_region(app, view);
-    Buffer_Cursor seek_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_pos_from_xy(app, view, (region.p0 + region.p1) / 2)));
+    Vec2_f32 p = (region.p1 - region.p0) * .5f;
 
-    result.seek_pos = buffer_compute_cursor(app, buffer, seek_line_col(seek_cursor.line, start_cursor.col)).pos;
+    i64 target_pos = view_pos_from_xy(app, view, p);
+    Buffer_Cursor target_cursor = view_compute_cursor(app, view, seek_pos(target_pos));
+    target_cursor = view_compute_cursor(app, view, seek_line_col(target_cursor.line, cursor.col));
 
+    result.seek_pos = target_cursor.pos;
     return result;
 }
 
 internal VIM_MOTION(vim_motion_page_bottom) {
     Vim_Motion_Result result = vim_motion_linewise(start_pos);
-    result.flags |= VimMotionFlag_SetPreferredX;
 
-    Buffer_Cursor start_cursor = buffer_compute_cursor(app, buffer, seek_pos(start_pos));
+    i64 pos = view_get_cursor_pos(app, view);
+    Buffer_Cursor cursor = view_compute_cursor(app, view, seek_pos(pos));
 
     Rect_f32 region = view_get_buffer_region(app, view);
-    // @TODO: This shouldn't be proportional, just step back one line height
-    region.y1 = region.y0 + cast(i32) (0.95f*(cast(f32) rect_height(region)));
-    Buffer_Cursor seek_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_pos_from_xy(app, view, region.p1)));
+    Vec2_f32 p = region.p1 - region.p0;
 
-    result.seek_pos = buffer_compute_cursor(app, buffer, seek_line_col(seek_cursor.line, start_cursor.col)).pos;
+    i64 target_pos = view_pos_from_xy(app, view, p);
+    Buffer_Cursor target_cursor = view_compute_cursor(app, view, seek_pos(target_pos));
+    target_cursor = view_compute_cursor(app, view, seek_line_col(target_cursor.line, cursor.col));
 
+    result.seek_pos = target_cursor.pos;
     return result;
 }
 
@@ -5304,6 +5335,8 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_split_window_horizontal,                         vim_char('w', KeyCode_Control), vim_char('s', KeyCode_Control));
 
     VimBind(center_view,                                         vim_char('z'), vim_char('z'));
+    VimBind(vim_view_move_line_to_top,                           vim_char('z'), vim_char('t'));
+    VimBind(vim_view_move_line_to_bottom,                        vim_char('z'), vim_char('b'));
 
     VimBind(vim_page_up,                                         vim_char('b', KeyCode_Control));
     VimBind(vim_page_down,                                       vim_char('f', KeyCode_Control));
