@@ -2345,11 +2345,17 @@ internal Vim_Motion_Result vim_motion_character_seek_internal(Application_Links*
     return result;
 }
 
+internal VIM_MOTION(vim_motion_repeat_character_seek_same_direction);
+internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction);
+
 internal VIM_MOTION(vim_motion_find_character) {
     String_Const_u8 target = vim_get_next_writable(app);
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Forward, false);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
@@ -2357,7 +2363,10 @@ internal VIM_MOTION(vim_motion_to_character) {
     String_Const_u8 target = vim_get_next_writable(app);
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Forward, true);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
@@ -2365,7 +2374,10 @@ internal VIM_MOTION(vim_motion_find_character_backward) {
     String_Const_u8 target = vim_get_next_writable(app);
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Backward, false);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
@@ -2373,7 +2385,10 @@ internal VIM_MOTION(vim_motion_to_character_backward) {
     String_Const_u8 target = vim_get_next_writable(app);
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Backward, true);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
@@ -2384,7 +2399,10 @@ internal VIM_MOTION(vim_motion_find_character_pair) {
     string_append(&target, vim_get_next_writable(app));
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target.string, Scan_Forward, false);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
@@ -2395,18 +2413,21 @@ internal VIM_MOTION(vim_motion_find_character_pair_backward) {
     string_append(&target, vim_get_next_writable(app));
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target.string, Scan_Backward, false);
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek;
+    for (i32 i = 1; i < motion_count; ++i) {
+        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+    }
+    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
     return mr;
 }
 
-internal VIM_MOTION(vim_motion_repeat_character_seek_forward) {
+internal VIM_MOTION(vim_motion_repeat_character_seek_same_direction) {
     Scan_Direction dir = vim_state.most_recent_character_seek_dir;
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     vim_state.character_seek_highlight_dir = dir;
     return vim_motion_character_seek_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_till);
 }
 
-internal VIM_MOTION(vim_motion_repeat_character_seek_backward) {
+internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction) {
     Scan_Direction dir = -vim_state.most_recent_character_seek_dir;
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     vim_state.character_seek_highlight_dir = dir;
@@ -5213,8 +5234,8 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_motion_to_character_backward,                    vim_char('T'));
     VimBind(vim_motion_find_character_pair,                      vim_char('s'));
     VimBind(vim_motion_find_character_pair_backward,             vim_char('S'));
-    VimBind(vim_motion_repeat_character_seek_forward,            vim_char(';'));
-    VimBind(vim_motion_repeat_character_seek_backward,           vim_char(','));
+    VimBind(vim_motion_repeat_character_seek_same_direction,     vim_char(';'));
+    VimBind(vim_motion_repeat_character_seek_reverse_direction,  vim_char(','));
 
     //
     // Normal Vim Map
