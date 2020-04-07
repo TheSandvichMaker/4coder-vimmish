@@ -4720,6 +4720,13 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
         history_group_end(vim_state.macro_history);
     }
 
+    View_ID active_view = get_active_view(app, Access_Always);
+    View_ID active_buffer = view_get_buffer(app, active_view, Access_Always);
+    u32 active_access_flags = buffer_get_access_flags(app, active_buffer);
+    if (!HasFlag(active_access_flags, Access_Write) && is_vim_insert_mode(vim_state.mode)) {
+        vim_enter_normal_mode_escape(app);
+    }
+
     for (View_ID view = get_view_next(app, 0, Access_ReadVisible); view; view = get_view_next(app, view, Access_ReadVisible)) {
         Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
         if (buffer_exists(app, buffer)) {
@@ -4737,8 +4744,11 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
                 } break;
                 case VimMode_Insert:
                 case VimMode_VisualInsert: {
-                    Assert(*insert_map_id_ptr);
-                    *map_id_ptr = *insert_map_id_ptr;
+                    u32 access_flags = buffer_get_access_flags(app, buffer);
+                    if (HasFlag(access_flags, Access_Write)) {
+                        Assert(*insert_map_id_ptr);
+                        *map_id_ptr = *insert_map_id_ptr;
+                    }
                 } break;
                 case VimMode_Visual:
                 case VimMode_VisualLine:
