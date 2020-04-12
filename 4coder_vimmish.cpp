@@ -138,6 +138,9 @@
 // - Make character highlights turn off in insert mode (after a change + seek motion)
 // - Visual Block forced to line end produces ranges that are one character short
 // - Fix jump history across buffers
+// - Macros is kill. No.
+// - Persistent echo
+// - Make ^N ^P style autocomplete with dropdown
 
 //
 // Internal Defines
@@ -568,9 +571,11 @@ struct Vim_Global_State {
 
     u8                   echo_string_storage[256];
     String_u8            echo_string;
+    ARGB_Color           echo_color;
     f32                  persistent_echo_string_timeout;
     u8                   persistent_echo_string_storage[256];
     String_u8            persistent_echo_string;
+    ARGB_Color           persistent_echo_color;
 };
 
 global Vim_Global_State vim_state;
@@ -653,6 +658,36 @@ internal String_Const_u8 vim_read_register(Application_Links* app, Vim_Register*
     return result;
 }
 
+enum Vim_Echo_Kind {
+    VimEcho_Normal,
+    VimEcho_Alert,
+    VimEcho_Error,
+};
+
+internal void vim_echo(Application_Links* app, Vim_Echo_Kind kind, char* fmt, ...) {
+    Scratch_Block scratch(app);
+
+    va_list args;
+    va_start(args, fmt);
+    String_Const_u8 formatted = push_u8_stringfv(scratch, fmt, args);
+    va_end(args);
+
+    vim_state.echo_string.size = 0;
+    string_append(&vim_state.echo_string, formatted);
+
+    switch (kind) {
+        case VimEcho_Normal: {
+            vim_state.echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+        } break;
+        case VimEcho_Alert: {
+            vim_state.echo_color = finalize_color(defcolor_comment_pop, 0);
+        } break;
+        case VimEcho_Error: {
+            vim_state.echo_color = finalize_color(defcolor_comment_pop, 1);
+        } break;
+    }
+}
+
 struct Vim_View_Attachment {
     Buffer_ID most_recent_known_buffer;
     i64       most_recent_known_pos;
@@ -693,6 +728,7 @@ internal void vim_delete_jump_history_at_index(Application_Links* app, i32 jump_
 }
 
 internal void vim_log_jump_history_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_View_Attachment* vim_view, i64 pos) {
+    ProfileScope(app, "[vim] log jump history");
     i64 line = get_line_number_from_pos(app, buffer, pos);
 
     Scratch_Block scratch(app);
@@ -1402,6 +1438,8 @@ CUSTOM_COMMAND_SIG(vim_set_mark) {
         if (mark) {
             mark->buffer = buffer;
             mark->pos = view_get_cursor_pos(app, view);
+        } else {
+            vim_echo(app, VimEcho_Error, "Unknown mark '%c'", mark_char);
         }
     }
 }
@@ -1431,6 +1469,8 @@ internal void vim_go_to_mark_internal(Application_Links* app, b32 reduced_jump_h
                 }
                 jump_to_location(app, view, mark->buffer, mark->pos);
             }
+        } else {
+            vim_echo(app, VimEcho_Error, "Unknown mark '%c'", mark_char);
         }
     }
 }
@@ -1529,6 +1569,7 @@ internal void vim_rel_move(Application_Links* app, Buffer_Seek seek) {
     view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
 }
 
+// @TODO: Replace this random global buffer?
 global u32 vim_insert_node_buffer_used;
 global u8 vim_insert_node_buffer[KB(1)];
 
@@ -1575,12 +1616,14 @@ internal void vim_add_abbreviation_(String_Const_u8 match, String_Const_u8 repla
 }
 
 internal void vim_apply_abbreviations_for_range(Application_Links* app, View_ID view, Range_i64 word_range) {
+    ProfileScope(app, "[vim] apply abbreviations for range");
     Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
     if (buffer_exists(app, buffer)) {
         Scratch_Block scratch(app);
         String_Const_u8 word = push_buffer_range(app, scratch, buffer, word_range);
 
+        // @TODO: Maybe consider creating some cool acceleration structure for this. Or not. Should be profiled, I guess.
         for (Vim_Abbreviation* abbreviation = vim_state.first_abbreviation; abbreviation; abbreviation = abbreviation->next) {
             if (string_match(word, abbreviation->match)) {
                 buffer_replace_range(app, buffer, word_range, abbreviation->replacement);
@@ -1868,23 +1911,25 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_block_mode) {
 }
 
 internal void vim_set_selection(Application_Links* app, View_ID view, Vim_Visual_Selection selection) {
-    Buffer_Cursor first = selection.range.first;
-    Buffer_Cursor one_past_last = selection.range.one_past_last;
-    if (!is_vim_visual_mode(vim_state.mode)) {
-        switch (selection.kind) {
-            case VimSelectionKind_Range: {
-                vim_toggle_visual_mode(app);
-            } break;
-            case VimSelectionKind_Line: {
-                vim_toggle_visual_line_mode(app);
-            } break;
-            case VimSelectionKind_Block: {
-                vim_toggle_visual_block_mode(app);
-            } break;
+    if (selection.kind) {
+        Buffer_Cursor first = selection.range.first;
+        Buffer_Cursor one_past_last = selection.range.one_past_last;
+        if (!is_vim_visual_mode(vim_state.mode)) {
+            switch (selection.kind) {
+                case VimSelectionKind_Range: {
+                    vim_toggle_visual_mode(app);
+                } break;
+                case VimSelectionKind_Line: {
+                    vim_toggle_visual_line_mode(app);
+                } break;
+                case VimSelectionKind_Block: {
+                    vim_toggle_visual_block_mode(app);
+                } break;
+            }
         }
+        view_set_mark(app, view, seek_line_col(first.line, first.col));
+        view_set_cursor_and_preferred_x(app, view, seek_line_col(one_past_last.line - 1, one_past_last.col - 1));
     }
-    view_set_mark(app, view, seek_line_col(first.line, first.col));
-    view_set_cursor_and_preferred_x(app, view, seek_line_col(one_past_last.line - 1, one_past_last.col - 1));
 }
 
 internal Range_i64 vim_apply_range_style(Application_Links* app, Buffer_ID buffer, Range_i64 range, Vim_Range_Style style) {
@@ -4228,12 +4273,24 @@ CUSTOM_DOC("[vim] Closes the current panel, or 4coder if this is the last panel.
 CUSTOM_COMMAND_SIG(w)
 CUSTOM_DOC("[vim] Saves the current buffer.")
 {
+    View_ID view = get_active_view(app, Access_Always);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
+    Scratch_Block scratch(app);
+    String_Const_u8 file_name = push_buffer_file_name(app, scratch, buffer);
+    vim_echo(app, VimEcho_Normal, "Wrote file '%.*s' to disk.", string_expand(file_name));
+
     save(app);
 }
 
 CUSTOM_COMMAND_SIG(wq)
 CUSTOM_DOC("[vim] Saves the current buffer and closes the current panel, or 4coder if this is the last panel.")
 {
+    View_ID view = get_active_view(app, Access_Always);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
+    Scratch_Block scratch(app);
+    String_Const_u8 file_name = push_buffer_file_name(app, scratch, buffer);
+    vim_echo(app, VimEcho_Normal, "Wrote file '%.*s' to disk.", string_expand(file_name));
+
     save(app);
     q(app);
 }
@@ -4712,11 +4769,12 @@ function void vim_draw_echo_bar(Application_Links *app, Face_ID face_id, Rect_f3
     f32 digit_advance = face_metrics.decimal_digit_advance;
 
     draw_rectangle(app, bar, 0.0f, fcolor_resolve(fcolor_id(defcolor_back)));
-    draw_string_oriented(app, face_id, fcolor_resolve(fcolor_id(defcolor_text_default)), vim_state.echo_string.string, bar.p0 + V2f32(2.0f, 2.0f), 0, V2f32(1, 0));
+    draw_string_oriented(app, face_id, vim_state.echo_color, vim_state.echo_string.string, bar.p0 + V2f32(2.0f, 2.0f), 0, V2f32(1, 0));
 
     // if (vim_state.recording_macro) {
     //     push_fancy_stringf(scratch, &list, pop2_color, "   recording @%c", vim_state.most_recent_macro_register);
     // }
+
     f32 step_back = 16*digit_advance;
     draw_string_oriented(app, face_id, fcolor_resolve(fcolor_id(defcolor_text_default)), vim_state.chord_bar.string, V2f32(bar.x1 - step_back, bar.y0 + 2.0f), 0, V2f32(1, 0));
 }
@@ -4779,10 +4837,9 @@ function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_
     Managed_ID bar_color = defcolor_bar;
 
 #if VIM_USE_CUSTOM_COLORS
-    if (vim_state.recording_macro) {
+    if (vim_state.recording_macro && VIM_USE_ECHO_BAR) {
         bar_color = defcolor_vim_bar_recording_macro;
     } else {
-
         switch (vim_state.mode) {
             case VimMode_Normal: {
                 bar_color = defcolor_vim_bar_normal;
@@ -4967,6 +5024,8 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
 function void vim_tick(Application_Links *app, Frame_Info frame_info) {
     default_tick(app, frame_info);
 
+    ProfileScope(app, "[vim] tick");
+
     if (vim_state.played_macro) {
         vim_state.played_macro = false;
         history_group_end(vim_state.macro_history);
@@ -5064,7 +5123,7 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
     for (;;) {
         // NOTE(allen): Get the binding from the buffer's current map
         User_Input input = get_next_input(app, EventPropertyGroup_Any, 0);
-        ProfileScopeNamed(app, "before view input", view_input_profile);
+        ProfileScopeNamed(app, "[vim] before view input", view_input_profile);
         if (input.abort) {
             break;
         }
@@ -5131,18 +5190,6 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
             }
 
             ProfileCloseNow(view_input_profile);
-
-#if 0
-            print_message(app, string_u8_litexpr("Insert nodes before executing binding:\n"));
-            for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
-                print_message(app, string_u8_litexpr("Forward: \""));
-                print_message(app, node->text_forward);
-                print_message(app, string_u8_litexpr("\"\n"));
-                print_message(app, string_u8_litexpr("Backward: \""));
-                print_message(app, node->text_backward);
-                print_message(app, string_u8_litexpr("\"\n"));
-            }
-#endif
 
             if (vim_bind) {
                 Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
@@ -5255,6 +5302,8 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
 
 BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
     default_buffer_edit_range(app, buffer_id, new_range, original_size);
+
+    ProfileScope(app, "[vim] buffer edit range");
     
     Range_i64 old_range = Ii64(new_range.first, new_range.first + original_size);
     // Range_i64 old_line_range = get_line_range_from_pos_range(app, buffer_id, old_range);
@@ -5638,7 +5687,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(kill_buffer,                                         vim_leader, vim_char('f'), vim_char('d'));
     VimBind(q,                                                   vim_leader, vim_char('f'), vim_char('q'));
     VimBind(qa,                                                  vim_leader, vim_char('f'), vim_char('Q'));
-    VimBind(save,                                                vim_leader, vim_char('f'), vim_char('w'));
+    VimBind(w,                                                   vim_leader, vim_char('f'), vim_char('w'));
     
     VimNameBind(string_u8_litexpr("Search"),                     vim_leader, vim_char('s'));
     VimBind(list_all_substring_locations_case_insensitive,       vim_leader, vim_char('s'), vim_char('s'));
@@ -5694,8 +5743,9 @@ internal void vim_init(Application_Links* app) {
     vim_state.search_direction = Scan_Forward;
     vim_state.chord_bar = Su8(vim_state.chord_bar_storage, 0, ArrayCount(vim_state.chord_bar_storage));
     vim_state.echo_string = Su8(vim_state.echo_string_storage, 0, ArrayCount(vim_state.echo_string_storage));
+    vim_state.echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
     vim_state.persistent_echo_string = Su8(vim_state.persistent_echo_string_storage, 0, ArrayCount(vim_state.persistent_echo_string_storage));
-    vim_state.echo_string.string = string_u8_litexpr("Testing... Roger that.");
+    vim_state.persistent_echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
 
     vim_set_default_colors(app);
 }
