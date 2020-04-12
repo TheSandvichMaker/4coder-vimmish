@@ -1485,13 +1485,6 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
     return selection;
 }
 
-internal void vim_set_selection(Application_Links* app, View_ID view, Vim_Visual_Selection selection) {
-    Buffer_Cursor first = selection.range.first;
-    Buffer_Cursor one_past_last = selection.range.one_past_last;
-    view_set_mark(app, view, seek_line_col(first.line, first.col));
-    view_set_cursor_and_preferred_x(app, view, seek_line_col(one_past_last.line - 1, one_past_last.col - 1));
-}
-
 internal b32 vim_selection_consume_line(Application_Links* app, Buffer_ID buffer, Vim_Visual_Selection* selection, Range_i64* out_range, b32 inclusive) {
     b32 result = false;
 
@@ -1536,6 +1529,9 @@ internal void vim_rel_move(Application_Links* app, Buffer_Seek seek) {
     view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
 }
 
+global u32 vim_insert_node_buffer_used;
+global u8 vim_insert_node_buffer[KB(1)];
+
 internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app, Buffer_ID buffer, Record_Info record, Buffer_Cursor insert_cursor) {
     if (!vim_state.first_free_insert_node) {
         vim_state.first_free_insert_node = push_array(&vim_state.arena, Vim_Insert_Node, 1);
@@ -1550,8 +1546,22 @@ internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app
 
     node->rel_line = cursor.line - insert_cursor.line;
     node->rel_col  = cursor.col  - insert_cursor.col;
-    node->text_forward  = record.single_string_forward;
-    node->text_backward = record.single_string_backward;
+
+    String_Const_u8 fwd = record.single_string_forward;
+    String_Const_u8 bck = record.single_string_backward;
+
+    Assert((vim_insert_node_buffer_used + fwd.size + bck.size) < sizeof(vim_insert_node_buffer));
+
+    u8* text_forward_buffer = vim_insert_node_buffer + vim_insert_node_buffer_used;
+    block_copy(text_forward_buffer, fwd.str, fwd.size);
+    vim_insert_node_buffer_used += cast(u32) fwd.size;
+
+    u8* text_backward_buffer = vim_insert_node_buffer + vim_insert_node_buffer_used;
+    block_copy(text_backward_buffer, bck.str, bck.size);
+    vim_insert_node_buffer_used += cast(u32) bck.size;
+
+    node->text_forward  = SCu8(text_forward_buffer, fwd.size);
+    node->text_backward = SCu8(text_backward_buffer, bck.size);
 
     return node;
 }
@@ -1581,35 +1591,44 @@ internal void vim_apply_abbreviations_for_range(Application_Links* app, View_ID 
 }
 
 internal void vim_begin_command(Application_Links* app, Buffer_ID buffer, Vim_Key_Binding* bind, i32 count, i32 count_was_set, Vim_Visual_Selection selection) {
-    Assert(!vim_state.command_in_progress);
-    vim_state.command_history = history_group_begin(app, buffer);
-    vim_state.command_in_progress = true;
-    if (HasFlag(bind->flags, VimBindingFlag_IsRepeatable)) {
-        Vim_Command_Rep* rep = &vim_state.next_command_rep;
-        block_zero_struct(rep);
-        rep->count = count;
-        rep->count_was_set = count_was_set;
-        switch (bind->kind) {
-            case VimBindingKind_Operator: {
-                rep->kind = VimCommandRep_Operator;
-                rep->selection = selection;
-                rep->reg = vim_state.active_register;
-                rep->op = bind->op;
-            } break;
-            case VimBindingKind_4CoderCommand: {
-                rep->kind = VimCommandRep_4CoderCommand;
-                rep->fcoder_command = bind->fcoder_command;
-            } break;
+    if (!vim_state.command_in_progress) {
+        // @TODO: Are there commands that are not repeatable that want grouped history?
+        if (HasFlag(bind->flags, VimBindingFlag_IsRepeatable)) {
+            vim_state.command_history = history_group_begin(app, buffer);
+            vim_state.command_in_progress = true;
+
+            Vim_Command_Rep* rep = &vim_state.next_command_rep;
+            block_zero_struct(rep);
+            rep->count = count;
+            rep->count_was_set = count_was_set;
+            switch (bind->kind) {
+                case VimBindingKind_Operator: {
+                    Vim_Visual_Selection local_selection = selection;
+                    local_selection.range.one_past_last.line -= local_selection.range.first.line;
+                    local_selection.range.one_past_last.col  -= local_selection.range.first.col;
+                    local_selection.range.first.line = 0;
+                    local_selection.range.first.col  = 0;
+                    rep->kind = VimCommandRep_Operator;
+                    rep->selection = local_selection;
+                    rep->reg = vim_state.active_register;
+                    rep->op = bind->op;
+                } break;
+                case VimBindingKind_4CoderCommand: {
+                    rep->kind = VimCommandRep_4CoderCommand;
+                    rep->fcoder_command = bind->fcoder_command;
+                } break;
+            }
         }
     }
 }
 
 internal void vim_end_command(Application_Links* app, b32 command_was_complete) {
-    Assert(vim_state.command_in_progress);
-    history_group_end(vim_state.command_history);
-    vim_state.command_in_progress = false;
-    if (command_was_complete) {
-        vim_state.command_rep = vim_state.next_command_rep;
+    if (vim_state.command_in_progress) {
+        history_group_end(vim_state.command_history);
+        vim_state.command_in_progress = false;
+        if (command_was_complete) {
+            vim_state.command_rep = vim_state.next_command_rep;
+        }
     }
 }
 
@@ -1641,6 +1660,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                 if (!vim_state.playing_back_command && insert_history_index <= current_history_index) {
                     vim_state.first_free_insert_node = vim_state.first_insert_node;
                     vim_state.first_insert_node = vim_state.last_insert_node = 0;
+                    vim_insert_node_buffer_used = 0;
 
                     // NOTE: Merge before processing so that a later merge won't shift around the memory of the strings
                     buffer_history_merge_record_range(app, buffer, insert_history_index, current_history_index, RecordMergeFlag_StateInRange_MoveStateForward);
@@ -1732,9 +1752,6 @@ CUSTOM_COMMAND_SIG(vim_enter_normal_mode_escape) {
     b32 end_command = false;
     if (is_vim_insert_mode(vim_state.mode)) {
         end_command = true;
-    } else {
-        // @TODO: Let's see if this lad fires
-        Assert(!vim_state.command_in_progress);
     }
     vim_enter_mode(app, VimMode_Normal);
     if (end_command) {
@@ -1848,6 +1865,26 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_block_mode) {
     } else {
         vim_enter_mode(app, VimMode_VisualBlock);
     }
+}
+
+internal void vim_set_selection(Application_Links* app, View_ID view, Vim_Visual_Selection selection) {
+    Buffer_Cursor first = selection.range.first;
+    Buffer_Cursor one_past_last = selection.range.one_past_last;
+    if (!is_vim_visual_mode(vim_state.mode)) {
+        switch (selection.kind) {
+            case VimSelectionKind_Range: {
+                vim_toggle_visual_mode(app);
+            } break;
+            case VimSelectionKind_Line: {
+                vim_toggle_visual_line_mode(app);
+            } break;
+            case VimSelectionKind_Block: {
+                vim_toggle_visual_block_mode(app);
+            } break;
+        }
+    }
+    view_set_mark(app, view, seek_line_col(first.line, first.col));
+    view_set_cursor_and_preferred_x(app, view, seek_line_col(one_past_last.line - 1, one_past_last.col - 1));
 }
 
 internal Range_i64 vim_apply_range_style(Application_Links* app, Buffer_ID buffer, Range_i64 range, Vim_Range_Style style) {
@@ -3181,7 +3218,7 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
     Scratch_Block scratch(app);
     List_String_Const_u8 yank_string_list = {};
 
-    state->motion = motion;
+    if (motion) state->motion = motion;
     while (vim_get_operator_range(state, &range, op_flags)) {
         Range_i64 line_range = get_line_range_from_pos_range(app, buffer, range);
 
@@ -3909,6 +3946,8 @@ internal VIM_OPERATOR(vim_miblo_decrement_sequence) {
 CUSTOM_COMMAND_SIG(vim_repeat_command) {
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
     View_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    History_Group rep_history = history_group_begin(app, buffer);
     
     if (!buffer_exists(app, buffer)) return;
     
@@ -3918,7 +3957,16 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
     switch (rep->kind) {
         case VimCommandRep_Operator: {
             Vim_Visual_Selection selection = rep->selection;
-            // @TODO: Rebase selection
+
+            Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
+            selection.range.first.line         += cursor.line;
+            selection.range.first.col          += cursor.col;
+            selection.range.one_past_last.line += cursor.line;
+            selection.range.one_past_last.col  += cursor.col;
+            
+            // @TODO: I'm pretty sure nobody uses the selection range .pos, they shouldn't (should probably stop using Buffer_Range...),
+            // but if they did it'd be wrong cuz I'm not recomputing it.
+
             Vim_Operator_State op_state = {};
             op_state.app          = app;
             op_state.view         = view;
@@ -3927,11 +3975,14 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
             op_state.op           = rep->op;
             op_state.motion_count = rep->motion_count;
             op_state.motion       = rep->motion;
+            op_state.text_object  = rep->text_object;
             op_state.selection    = selection;
             op_state.total_range  = Ii64_neg_inf;
 
+            vim_set_selection(app, view, selection);
+
             vim_state.active_register = rep->reg;
-            rep->op(app, &op_state, view, buffer, rep->selection, rep->count, rep->count_was_set);
+            rep->op(app, &op_state, view, buffer, selection, rep->count, rep->count_was_set);
             vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
         } break;
         
@@ -3942,7 +3993,7 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
         } break;
     }
 
-    if (vim_state.mode == VimMode_Insert) {
+    if (is_vim_insert_mode(vim_state.mode)) {
         Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
         i64 end_pos = cursor.pos;
         for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
@@ -3957,6 +4008,8 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
     }
 
     vim_state.playing_back_command = false;
+
+    history_group_end(rep_history);
 }
 
 internal b32 vim_split_window_internal(Application_Links* app, View_ID view, Dimension dim) {
@@ -5035,14 +5088,13 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
 
         Vim_Binding_Map* map = vim_get_map_for_mode(vim_state.mode);
 
-        // TODO: Do I need this?? Macros use it.
         if (!get_current_input_is_virtual(app)) {
             Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
             Buffer_Cursor cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
             Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
             vim_state.command_start_pos = back_cursor.pos;
         }
-
+        
         vim_state.capture_queries_into_chord_bar = true;
 
         i32 op_count = 1;
@@ -5079,6 +5131,18 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
             }
 
             ProfileCloseNow(view_input_profile);
+
+#if 0
+            print_message(app, string_u8_litexpr("Insert nodes before executing binding:\n"));
+            for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
+                print_message(app, string_u8_litexpr("Forward: \""));
+                print_message(app, node->text_forward);
+                print_message(app, string_u8_litexpr("\"\n"));
+                print_message(app, string_u8_litexpr("Backward: \""));
+                print_message(app, node->text_backward);
+                print_message(app, string_u8_litexpr("\"\n"));
+            }
+#endif
 
             if (vim_bind) {
                 Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
@@ -5510,13 +5574,14 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_miblo_increment_sequence,                        vim_char('g'), vim_char('a', KeyCode_Control));
     VimBind(vim_miblo_decrement_sequence,                        vim_char('g'), vim_char('x', KeyCode_Control));
 
+    // @TODO: Doing that ->flags thing is a bit weird...
     VimBind(vim_enter_insert_mode,                               vim_char('i'))->flags |= VimBindingFlag_TextCommand;
     VimBind(vim_enter_insert_sol_mode,                           vim_char('I'))->flags |= VimBindingFlag_TextCommand;
     VimBind(vim_enter_append_mode,                               vim_char('a'))->flags |= VimBindingFlag_TextCommand;
     VimBind(vim_enter_append_eol_mode,                           vim_char('A'))->flags |= VimBindingFlag_TextCommand;
-    VimBind(vim_toggle_visual_mode,                              vim_char('v'))->flags |= VimBindingFlag_TextCommand;
-    VimBind(vim_toggle_visual_line_mode,                         vim_char('V'))->flags |= VimBindingFlag_TextCommand;
-    VimBind(vim_toggle_visual_block_mode,                        vim_char('v', KeyCode_Control))->flags |= VimBindingFlag_TextCommand;
+    VimBind(vim_toggle_visual_mode,                              vim_char('v'));
+    VimBind(vim_toggle_visual_line_mode,                         vim_char('V'));
+    VimBind(vim_toggle_visual_block_mode,                        vim_char('v', KeyCode_Control));
 
     VimBind(change_active_panel,                                 vim_char('w', KeyCode_Control), vim_char('w'));
     VimBind(change_active_panel,                                 vim_char('w', KeyCode_Control), vim_char('w', KeyCode_Control));
