@@ -103,7 +103,7 @@
 #endif
 
 #ifndef VIM_CURSOR_ROUNDNESS
-#define VIM_CURSOR_ROUNDNESS 1.9f
+#define VIM_CURSOR_ROUNDNESS 0.9f
 #endif
 
 //
@@ -127,13 +127,8 @@
 // - Support marks as motions
 // - Apparently, vim has some weird timing thing regarding conflicting binds. I've never noticed it, and it seems awful. But if you're weird, you could implement it.
 // - Check out what's going on with text objects with a count > 1
-// - Have an alternate approach for dealing with repeat inputs turning into the line text object (cc, dd, etc),
-//   so that the "fallback" map can be removed from binding queries, and it should work either when you repeat
-//   the last character in your input, or the entire input. So, "glgl" and "gll" should both run the "gl" operator
-//   on the line.
 // - Why does the word motion no longer stop on empty lines properly? Is it because of crlf line endings?
 // - Review what should go into the view attachment versus the buffer attachment versus the global state.
-// - Make it possible to set the register for a command again
 // - Investigate: Next search gets caught on push_render_element in handmade_render_group.cpp
 // - Make character highlights turn off in insert mode (after a change + seek motion)
 // - Visual Block forced to line end produces ranges that are one character short
@@ -149,7 +144,7 @@
 //
 
 #define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // NOTE: I don't really think this is good for my use, but it's here if you like things that complicate your life
-#define VIM_PRINT_COMMANDS 0
+#define VIM_PRINT_COMMANDS 1
 
 #define VIM_DEFAULT_BINDING_MAP_SLOT_COUNT 32
 #define VIM_DEFAULT_NESTED_BINDING_MAP_SLOT_COUNT 8
@@ -655,6 +650,19 @@ internal Vim_Key_Sequence vim_key_sequence(
     return result;
 }
 
+inline b32 vim_append_key_to_sequence(Vim_Key_Sequence* seq, Vim_Key key) {
+    b32 result = false;
+    if (seq->count < ArrayCount(seq->keys)) {
+        result = true;
+        seq->keys[seq->count++] = key;
+    }
+    return result;
+}
+
+inline void vim_clear_sequence(Vim_Key_Sequence* seq) {
+    seq->count = 0;
+}
+
 struct Vim_Global_State {
     Arena                arena;
     Heap                 heap;
@@ -680,6 +688,7 @@ struct Vim_Global_State {
 
     b32                  current_key_is_retired;
     Vim_Key              current_key;
+    Vim_Key_Sequence     current_key_sequence;
 
     union {
         Vim_Register alphanumeric_registers[26 + 10];
@@ -1058,7 +1067,7 @@ internal void vim_add_parent_binding_map(Vim_Binding_Map* dest, Vim_Binding_Map*
     }
 }
 
-internal Vim_Key_Binding* make_or_retrieve_vim_binding_internal(Vim_Binding_Map* map, Vim_Key key, b32 make_if_doesnt_exist) {
+internal Vim_Key_Binding* vim_make_or_retrieve_binding_internal(Vim_Binding_Map* map, Vim_Key key, b32 make_if_doesnt_exist) {
     Assert(map);
 
     Vim_Key_Binding* result = 0;
@@ -1094,12 +1103,12 @@ internal Vim_Key_Binding* make_or_retrieve_vim_binding_internal(Vim_Binding_Map*
     return result;
 }
 
-internal Vim_Key_Binding* retrieve_vim_binding(Vim_Binding_Map* map, Vim_Key key) {
-    return make_or_retrieve_vim_binding_internal(map, key, false);
+internal Vim_Key_Binding* vim_retrieve_binding(Vim_Binding_Map* map, Vim_Key key) {
+    return vim_make_or_retrieve_binding_internal(map, key, false);
 }
 
-internal Vim_Key_Binding* make_or_retrieve_vim_binding(Vim_Binding_Map* map, Vim_Key key) {
-    return make_or_retrieve_vim_binding_internal(map, key, true);
+internal Vim_Key_Binding* vim_make_or_retrieve_binding(Vim_Binding_Map* map, Vim_Key key) {
+    return vim_make_or_retrieve_binding_internal(map, key, true);
 }
 
 enum Vim_Query_Mode {
@@ -1150,20 +1159,6 @@ internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
     return result;
 }
 
-internal void vim_query_register(Application_Links* app, Vim_Query_Mode mode) {
-    User_Input in = (mode == VimQuery_CurrentInput) ? get_current_input(app) : vim_get_next_keystroke(app);
-
-    if (in.abort) {
-        return;
-    }
-
-    // @FirstDependentText
-    Input_Event* text = in.event.key.first_dependent_text;
-    if (text && text->text.string.str[0] == '"') {
-        print_message(app, string_u8_litexpr("I love the smell of double quotes in the morning.\n"));
-    }
-}
-
 internal Vim_Key vim_get_key_from_input_query(Application_Links* app, Vim_Query_Mode mode) {
     Vim_Key result = {};
 
@@ -1183,41 +1178,23 @@ internal Vim_Key vim_get_key_from_input_query(Application_Links* app, Vim_Query_
     Scratch_Block scratch(app);
     if (in.event.kind == InputEventKind_KeyStroke) {
         while (key_code_to_vim_modifier(in.event.key.code)) {
-            in = get_next_input(app, EventProperty_AnyKey, EventProperty_ViewActivation|EventProperty_Exit);
-            if (in.abort) break;
+            in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+            if (in.abort) {
+                return result;
+            }
         }
 
         result.kc = cast(u16) in.event.key.code;
         result.mods = input_modifier_set_to_vim_modifiers(in.event.key.modifiers);
 
-        print_message(app, push_u8_stringf(scratch, "Sequence number: %lld\n", get_current_input_sequence_number(app)));
-        print_message(app, SCu8(key_code_name[result.kc], cstring_length(key_code_name[result.kc])));
-        print_message(app, string_u8_litexpr("\n"));
-
         if (in.event.key.first_dependent_text) {
             leave_current_input_unhandled(app);
-            in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+            in = get_next_input(app, EventProperty_TextInsert, EventProperty_ViewActivation|EventProperty_Exit);
         }
     }
 
-    if (in.abort) {
-        return result;
-    }
-
-    if (in.event.kind == InputEventKind_TextInsert) {
+    if (!in.abort && in.event.kind == InputEventKind_TextInsert) {
         String_Const_u8 writable = to_writable(&in);
-        print_message(app, push_u8_stringf(scratch, "Sequence number: %lld\n", get_current_input_sequence_number(app)));
-        print_message(app, writable);
-        print_message(app, string_u8_litexpr("\n"));
-
-        Input_Event* event = &in.event;
-        while (event->text.next_text) {
-            event = event->text.next_text;
-            String_Const_u8 next = event->text.string;
-            print_message(app, string_u8_litexpr("next: "));
-            print_message(app, next);
-            print_message(app, string_u8_litexpr("\n"));
-        }
 
         if (vim_state.capture_queries_into_chord_bar) {
             vim_append_chord_bar(writable, result.mods);
@@ -1248,6 +1225,7 @@ inline Vim_Key vim_get_current_key(Application_Links* app) {
 
 inline void vim_retire_key() {
     vim_state.current_key_is_retired = true;
+    vim_append_key_to_sequence(&vim_state.current_key_sequence, vim_state.current_key);
 }
 
 inline Vim_Key vim_get_next_key(Application_Links* app) {
@@ -1255,10 +1233,11 @@ inline Vim_Key vim_get_next_key(Application_Links* app) {
     return vim_get_current_key(app);
 }
 
-internal void vim_begin_query(Application_Links* app) {
+internal void vim_begin_query(Application_Links* app, Vim_Query_Mode mode) {
+    vim_clear_sequence(&vim_state.current_key_sequence);
     vim_state.capture_queries_into_chord_bar = true;
     vim_state.current_key_is_retired = false;
-    vim_state.current_key = vim_get_key_from_current_input(app);
+    vim_state.current_key = vim_get_key_from_input_query(app, mode);
 }
 
 internal void vim_end_query() {
@@ -1324,31 +1303,50 @@ internal i64 vim_query_number(Application_Links* app, b32 handle_sign = false) {
     return result;
 }
 
-internal Vim_Register* vim_query_and_set_register(Application_Links* app) {
-    Vim_Register* result = 0;
-    Vim_Key key = vim_get_current_key(app);
-    if (key.codepoint == '"') {
-        key = vim_get_next_key(app);
-        result = vim_get_register(cast(u8) key.codepoint);
-        if (result) {
-            vim_state.active_register = result;
-            vim_retire_key(); // @ConsumeKeyOnSuccess
-        }
-    }
+inline b32 vim_keys_are_equal(Vim_Key a, Vim_Key b) {
+    b32 result = (a.kc == b.kc && a.mods == b.mods && a.codepoint == b.codepoint);
     return result;
 }
 
-internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Map* map) {
+// @Cleanup: Rearrage to make the forward declare unnecessary. Maybe.
+internal VIM_TEXT_OBJECT(vim_text_object_line);
+
+// @TODO: Is this how we want to do this?
+Vim_Key_Binding vim_text_object_line_bind = {
+    VimBindingKind_TextObject,
+    string_u8_litexpr("vim_text_object_line (from key repeat)"),
+    0,
+    vim_text_object_line
+};
+
+internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Map* map, b32 line_object_on_repeat_input) {
+    Vim_Key_Sequence prev_seq = vim_state.current_key_sequence;
     Vim_Key key = vim_get_current_key(app);
-    Vim_Key_Binding* bind = retrieve_vim_binding(map, key);
+    Vim_Key previous_final_key = prev_seq.keys[prev_seq.count - 1];
+    if (line_object_on_repeat_input && (prev_seq.count > 0) && vim_keys_are_equal(key, previous_final_key)) {
+        vim_retire_key(); // @ConsumeKeyOnSuccess
+        return &vim_text_object_line_bind;
+    }
+
+    Vim_Key_Binding* bind = vim_retrieve_binding(map, key);
 
 #if VIM_PRINT_COMMANDS
     vim_print_bind(app, bind);
 #endif
 
+    i32 prev_seq_index = 0;
+    b32 matches_previous_sequence = (prev_seq.count > 0) && vim_keys_are_equal(key, prev_seq.keys[prev_seq_index++]);
     while (bind && bind->kind == VimBindingKind_Map) {
-        key  = vim_get_next_key(app);
-        bind = retrieve_vim_binding(bind->map, key);
+        key = vim_get_next_key(app);
+
+        if (line_object_on_repeat_input && matches_previous_sequence) {
+            matches_previous_sequence = vim_keys_are_equal(key, prev_seq.keys[prev_seq_index++]);
+            if (matches_previous_sequence && (prev_seq_index == prev_seq.count)) {
+                return &vim_text_object_line_bind;
+            }
+        }
+
+        bind = vim_retrieve_binding(bind->map, key);
 
         if (!bind) {
             break;
@@ -1364,6 +1362,32 @@ internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_
     }
 
     return bind;
+}
+
+CUSTOM_COMMAND_SIG(vim_register) {
+    // NOTE: Stub... Because picking a register for a command is a special kind
+    // of operation, it is implemented outside the regular binding system. You
+    // can still pick which key is used to denote a register selection by
+    // binding this command, but it must be a single key binding.
+}
+
+internal Vim_Register* vim_query_and_set_register(Application_Links* app, Vim_Binding_Map* map) {
+    Vim_Register* result = 0;
+    Vim_Key key = vim_get_current_key(app);
+    Vim_Key_Binding* bind = vim_retrieve_binding(map, key);
+    if (bind && bind->fcoder_command == vim_register) {
+        key = vim_get_next_key(app);
+        result = vim_get_register(cast(u8) key.codepoint);
+        if (result) {
+            vim_state.active_register = result;
+            vim_retire_key(); // @ConsumeKeyOnSuccess
+#if VIM_PRINT_COMMANDS
+            Scratch_Block scratch(app);
+            print_message(app, push_u8_stringf(scratch, "Active Register: \"%c\n", cast(u8) key.codepoint));
+#endif
+        }
+    }
+    return result;
 }
 
 internal void vim_begin_macro(Application_Links* app, u8 reg_char) {
@@ -1401,6 +1425,8 @@ internal void vim_end_macro(Application_Links* app, u8 reg_char) {
 
         Scratch_Block scratch(app);
         String_Const_u8 macro_string = push_buffer_range(app, scratch, buffer, range);
+        print_message(app, string_u8_litexpr("macro string:\n"));
+        print_message(app, macro_string);
 
         vim_write_register(app, reg, macro_string);
     }
@@ -1747,6 +1773,20 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
     if (!buffer_exists(app, buffer)) {
         return;
     }
+
+#if VIM_PRINT_COMMANDS
+    print_message(app, string_u8_litexpr("Switching mode: "));
+    switch (mode) {
+#define PRINT_MODE(MODE) case VimMode_##MODE: { print_message(app, string_u8_litexpr("VimMode_" #MODE "\n")); } break;
+        PRINT_MODE(Normal);
+        PRINT_MODE(Insert);
+        PRINT_MODE(VisualInsert);
+        PRINT_MODE(Visual);
+        PRINT_MODE(VisualLine);
+        PRINT_MODE(VisualBlock);
+#undef PRINT_MODE
+    }
+#endif
 
     switch (mode) {
         case VimMode_Normal: {
@@ -3222,11 +3262,11 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
             }
         } else if (HasFlag(flags, VimOpFlag_QueryMotion)) {
             if (!state->motion && !state->text_object) {
-                i64 count_query = vim_query_number(app, VimQuery_NextInput);
+                i64 count_query = vim_query_number(app);
                 state->motion_count = cast(i32) clamp(1, count_query, VIM_MAXIMUM_OP_COUNT);
                 state->motion_count_was_set = (count_query != 0);
 
-                Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending);
+                Vim_Key_Binding* query = vim_query_binding(app, &vim_map_operator_pending, true);
                 if (query) {
                     if (query->kind == VimBindingKind_Motion) {
                         state->motion = query->motion;
@@ -3394,7 +3434,7 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
     }
 
     if (did_act && mode != VimDCY_Yank) {
-        // view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
+        view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
     }
 }
 
@@ -3437,21 +3477,6 @@ internal VIM_OPERATOR(vim_replace) {
     while (vim_get_operator_range(state, &range)) {
         for (i64 replace_cursor = range.min; replace_cursor < range.max; replace_cursor++) {
             buffer_replace_range(app, buffer, Ii64(replace_cursor, view_set_pos_by_character_delta(app, view, replace_cursor, 1)), replace_char);
-        }
-    }
-}
-
-CUSTOM_COMMAND_SIG(vim_register) {
-    String_Const_u8 reg_str = vim_get_next_writable(app);
-    if (reg_str.size) {
-        u8 reg_char = reg_str.str[0];
-        Vim_Register* reg = vim_get_register(reg_char);
-        if (reg) {
-            vim_state.active_register = reg;
-
-            User_Input dummy = vim_get_next_keystroke(app); // Note: Because vim_handle_input checks current input
-            // @TODO: Do whatever we want to make vim_register behave nice
-            // vim_handle_input(app);
         }
     }
 }
@@ -4069,6 +4094,10 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
     
     vim_state.playing_back_command = true;
 
+#if VIM_PRINT_COMMANDS
+    print_message(app, string_u8_litexpr("Repeating Command.\n"));
+#endif
+
     Vim_Visual_Selection selection = {};
     Vim_Command_Rep* rep = &vim_state.command_rep;
     switch (rep->kind) {
@@ -4508,7 +4537,7 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence
 
     if (binding_sequence.count > 0) {
         Vim_Key key1 = binding_sequence.keys[0];
-        result = make_or_retrieve_vim_binding(map, key1);
+        result = vim_make_or_retrieve_binding(map, key1);
 
         for (i32 key_index = 1; key_index < binding_sequence.count; key_index++) {
             Vim_Key next_key = binding_sequence.keys[key_index];
@@ -4517,7 +4546,7 @@ internal Vim_Key_Binding* add_vim_binding(Vim_Binding_Map* map, Vim_Key_Sequence
                 result->map = vim_new_binding_map(VIM_DEFAULT_NESTED_BINDING_MAP_SLOT_COUNT);
             }
 
-            result = make_or_retrieve_vim_binding(result->map, next_key);
+            result = vim_make_or_retrieve_binding(result->map, next_key);
         }
     }
 
@@ -4601,7 +4630,7 @@ internal void vim_unbind_(Vim_Binding_Map* map, Vim_Key_Sequence sequence) {
     Vim_Key_Binding* bind = 0;
     for (i32 key_index = 0; key_index < sequence.count; key_index++) {
         Vim_Key key = sequence.keys[key_index];
-        bind = retrieve_vim_binding(map, key);
+        bind = vim_retrieve_binding(map, key);
 #if 1
         Assert(bind);
 #endif
@@ -5203,6 +5232,14 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
     }
 
     for (;;) {
+        // NOTE: This is to make it easy for macros to know exactly where to end
+        if (!get_current_input_is_virtual(app)) {
+            Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
+            Buffer_Cursor cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
+            // Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
+            vim_state.command_start_pos = cursor.pos;
+        }
+
         // NOTE(allen): Get the binding from the buffer's current map
         User_Input input = get_next_input(app, EventPropertyGroup_Any, 0);
         ProfileScopeNamed(app, "[vim] before view input", view_input_profile);
@@ -5226,13 +5263,6 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
         Command_Map_ID map_id = *map_id_ptr;
 
         Command_Binding binding = map_get_binding_recursive(&framework_mapping, map_id, &input.event);
-
-        if (!get_current_input_is_virtual(app)) {
-            Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
-            Buffer_Cursor cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
-            Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
-            vim_state.command_start_pos = back_cursor.pos;
-        }
         
         i32 op_count = 1;
         b32 op_count_was_set = false;
@@ -5241,9 +5271,9 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
             Vim_Binding_Map* map = vim_get_map_for_mode(vim_state.mode);
 
             if (map && map->allocator) {
-                vim_begin_query(app);
+                vim_begin_query(app, VimQuery_CurrentInput);
 
-                vim_query_and_set_register(app);
+                vim_query_and_set_register(app, map);
 
                 op_count = 1;
                 op_count_was_set = false;
@@ -5253,9 +5283,9 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
                     op_count_was_set = (queried_number != 0);
                 }
 
-                vim_query_and_set_register(app);
+                vim_query_and_set_register(app, map);
 
-                vim_bind = vim_query_binding(app, map);
+                vim_bind = vim_query_binding(app, map, false);
             }
         }
 
