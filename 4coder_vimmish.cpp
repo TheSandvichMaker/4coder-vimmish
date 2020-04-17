@@ -56,6 +56,10 @@
 // User-Configuable Defines
 //
 
+#ifndef VIM_ESCAPE_SEQUENCE
+#define VIM_ESCAPE_SEQUENCE "jk"
+#endif
+
 #ifndef VIM_MOUSE_SELECT_MODE
 #define VIM_MOUSE_SELECT_MODE Visual
 #endif
@@ -120,9 +124,7 @@
 // - Make command repetition work by storing the command and the required motion / selection information to execute it rather than using macros
 
 // Things to do:
-// - Fix jump history across buffers
 // - Option to disable mouse during insert mode (to avoid stupid palming of my touchpad)
-// - People like that thing where they can use some textual key sequence to escape from insert mode, I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
 // - Create a non-stopgap solution to case sensitive / whole word searches (tab during search query would be better suited to auto complete)
 // - Do stuff with 0-9 registers (or yeet them because... does anybody use these?)
@@ -141,6 +143,7 @@
 // - Make my mind up about how to special case change ops that open a new line (cc, ci{, etc)
 // - Dead keys (needs support from Allen)
 // - Figure out how to change the size of the "global" region properly, so people can handle the echo bar.
+// - Edit autoindent proper instead of using my hacky function
 
 //
 // Internal Defines
@@ -379,6 +382,7 @@ enum Vim_Motion_Flag {
     VimMotionFlag_AlwaysSeek                = 0x10,
     VimMotionFlag_LogJumpPostSeek           = 0x20,
     VimMotionFlag_IgnoreMotionCount         = 0x40,
+    VimMotionFlag_InvalidMotion             = 0x80,
 };
 
 struct Vim_Motion_Result {
@@ -452,7 +456,6 @@ typedef VIM_OPERATOR(Vim_Operator);
 enum Vim_Operator_Flag {
     VimOpFlag_QueryMotion     = 0x1,
     VimOpFlag_ChangeBehaviour = 0x2,
-    VimOpFlag_DeleteBehaviour = 0x4,
 };
 
 struct Vim_Operator_State {
@@ -682,6 +685,7 @@ struct Vim_Global_State {
     b32                  insert_sequence;
     i64                  insert_sequence_pos;
     i64                  insert_sequence_start_pos;
+    u8                   prev_insert_char;
 
     b32                  visual_block_force_to_line_end;
     b32                  right_justify_visual_insert;
@@ -1428,8 +1432,6 @@ internal void vim_end_macro(Application_Links* app, u8 reg_char) {
 
         Scratch_Block scratch(app);
         String_Const_u8 macro_string = push_buffer_range(app, scratch, buffer, range);
-        print_message(app, string_u8_litexpr("macro string:\n"));
-        print_message(app, macro_string);
 
         vim_write_register(app, reg, macro_string);
     }
@@ -3267,10 +3269,6 @@ function void vim_write_text(Application_Links *app, String_Const_u8 insert) {
         
         Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
-        print_message(app, string_u8_litexpr("vim_write_text insert: "));
-        print_message(app, insert);
-        print_message(app, string_u8_litexpr("\n"));
-
         if (buffer_replace_range(app, buffer, Ii64(pos), insert)) {
             view_set_cursor_and_preferred_x(app, view, seek_pos(pos + insert.size));
         }
@@ -3546,23 +3544,13 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                 vim_state.executing_queried_motion = false;
                 range = mr.range_;
 
+                if (HasFlag(mr.flags, VimMotionFlag_InvalidMotion)) {
+                    result = false;
+                }
                 if (HasFlag(mr.flags, VimMotionFlag_AlwaysSeek)) {
                     vim_seek_motion_result(app, view, buffer, mr);
                 }
             } else if (state->text_object) {
-                if (HasFlag(flags, VimOpFlag_DeleteBehaviour)) {
-                    if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_delete;
-                    else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_delete;
-                }
-
-                if (HasFlag(flags, VimOpFlag_ChangeBehaviour)) {
-                    // if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_change;
-                    // else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_change;
-                    if      (state->text_object == vim_text_object_inner_scope) state->text_object = vim_text_object_inner_scope_delete;
-                    else if (state->text_object == vim_text_object_inner_paren) state->text_object = vim_text_object_inner_paren_delete;
-                    else if (state->text_object == vim_text_object_line)        state->text_object = vim_text_object_inner_line;
-                }
-
                 i64 pos = view_get_cursor_pos(app, view);
 
                 vim_state.executing_queried_motion = true;
@@ -3674,22 +3662,24 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
         vim_write_register(app, vim_state.active_register, yank_string, from_block_copy);
     }
 
+    b32 set_cursor = true;
     if (mode == VimDCY_Change && did_act) {
         if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
             vim_enter_visual_insert_mode(app);
         } else {
-            if (state->text_object == vim_text_object_inner_scope_delete || 
-                state->text_object == vim_text_object_inner_paren_delete)
+            // @TODO: This still seems like a gross solution
+            if (state->text_object == vim_text_object_inner_scope ||
+                state->text_object == vim_text_object_inner_paren ||
+                state->text_object == vim_text_object_line)
             {
-                view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
-                vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+                set_cursor = false;
+                vim_new_line_above(app);
             }
-
             vim_enter_insert_mode(app);
         }
     }
 
-    if (did_act && mode != VimDCY_Yank) {
+    if (set_cursor && did_act && mode != VimDCY_Yank) {
         view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
     }
 }
@@ -4592,6 +4582,7 @@ CUSTOM_DOC("[vim] Inserts text and auto-indents the line on which the cursor sit
     ProfileScope(app, "[vim] write, abbrev, and auto indent");
 
     View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    // Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
 
     i64 pos = view_get_cursor_pos(app, view);
 
@@ -4603,6 +4594,20 @@ CUSTOM_DOC("[vim] Inserts text and auto-indents the line on which the cursor sit
 
     User_Input in = get_current_input(app);
     String_Const_u8 insert = to_writable(&in);
+
+    if (sizeof(VIM_ESCAPE_SEQUENCE) >= 3) {
+        u8 this_char = insert.size > 0 ? insert.str[0] : 0;
+        u8 prev_char = vim_state.prev_insert_char;
+        vim_state.prev_insert_char = this_char;
+        if (this_char &&
+            prev_char == VIM_ESCAPE_SEQUENCE[0] &&
+            this_char == VIM_ESCAPE_SEQUENCE[1])
+        {
+            backspace_char(app);
+            vim_enter_normal_mode_escape(app);
+            return;
+        }
+    }
 
     if (insert.str != 0 && insert.size > 0) {
         b32 do_abbrev = false;
@@ -5323,7 +5328,6 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
         {
             Buffer_ID keyboard_log_buffer = get_keyboard_log_buffer(app);
             Buffer_Cursor cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_pos(buffer_get_size(app, keyboard_log_buffer)));
-            // Buffer_Cursor back_cursor = buffer_compute_cursor(app, keyboard_log_buffer, seek_line_col(cursor.line - 1, 1));
             vim_state.command_start_pos = cursor.pos;
         }
 
@@ -5953,6 +5957,10 @@ internal void vim_init(Application_Links* app) {
     vim_state.echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
     vim_state.persistent_echo_string = Su8(vim_state.persistent_echo_string_storage, 0, ArrayCount(vim_state.persistent_echo_string_storage));
     vim_state.persistent_echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+
+    if (sizeof(VIM_ESCAPE_SEQUENCE) != 0 && sizeof(VIM_ESCAPE_SEQUENCE) != 3) {
+        vim_echo_alert(app, "Warning: Only two-character escape sequences are supported.");
+    }
 
     vim_set_default_colors(app);
 }
