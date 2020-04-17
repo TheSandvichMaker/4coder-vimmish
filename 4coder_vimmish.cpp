@@ -8,13 +8,19 @@
 
     You could override some defines here:
     // #define VIM_MOUSE_SELECT_MODE             [Visual / VisualLine / VisualBlock]        [default: Visual]
-    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS [0 / 1]                                    [default: 1]
+    // #define VIM_ESCAPE_SEQUENCE               [two character string]                     [default: "jk"]
+    // #define VIM_AUTO_LINE_COMMENTS            [0 / 1]                                    [default: 1]
     // #define VIM_CASE_SENSITIVE_CHARACTER_SEEK [0 / 1]                                    [default: 1]
     // #define VIM_AUTO_INDENT_ON_PASTE          [0 / 1]                                    [default: 1]
-    // #define VIM_USE_CUSTOM_COLORS             [0 / 1]                                    [default: 1]
     // #define VIM_DEFAULT_REGISTER              [unnamed_register / clipboard_register]    [default: unnamed_register]
     // #define VIM_JUMP_HISTORY_SIZE             [integer]                                  [default: 100]
     // #define VIM_MAXIMUM_OP_COUNT              [integer]                                  [default: 256]
+    // #define VIM_USE_CUSTOM_COLORS             [0 / 1]                                    [default: 1]
+    // #define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS [0 / 1]                                    [default: 1]
+    // #define VIM_FILE_BAR_ON_BOTTOM            [0 / 1]                                    [default: 0]
+    // #define VIM_DRAW_PANEL_MARGINS            [0 / 1 / 2]                                [default: 2] (0: don't draw, 1: minimal vertical margins, 2: full margins)
+    // #define VIM_PANEL_MARGIN_THICKNESS        [float]                                    [default: 3.0f]
+    // #define VIM_USE_ECHO_BAR                  [0 / 1]                                    [default: 0]
     // #define VIM_CURSOR_ROUNDNESS              [float]                                    [default: 0.9f]
 
     #include "4coder_vimmish.cpp"
@@ -44,9 +50,11 @@
     // defcolor_vim_bar_normal -- filebar color in normal mode
     // defcolor_vim_bar_insert -- filebar color in insert mode
     // defcolor_vim_bar_visual -- filebar color in visual mode
+    // defcolor_vim_bar_recording_macro -- filebar color when recording a macro
     // defcolor_vim_cursor_normal -- cursor color in normal mode
     // defcolor_vim_cursor_insert -- cursor color in insert mode
     // defcolor_vim_cursor_visual -- cursor color in visual mode
+    // defcolor_vim_character_highlight -- color of character highlights from character seek
 */
 
 // @TODO: Make window movements not come from an include
@@ -56,24 +64,20 @@
 // User-Configuable Defines
 //
 
-#ifndef VIM_ESCAPE_SEQUENCE
-#define VIM_ESCAPE_SEQUENCE "jk"
-#endif
-
 #ifndef VIM_MOUSE_SELECT_MODE
 #define VIM_MOUSE_SELECT_MODE Visual
 #endif
 
-#ifndef VIM_USE_CHARACTER_SEEK_HIGHLIGHTS
-#define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 1
+#ifndef VIM_ESCAPE_SEQUENCE
+#define VIM_ESCAPE_SEQUENCE "jk"
+#endif
+
+#ifndef VIM_AUTO_LINE_COMMENTS
+#define VIM_AUTO_LINE_COMMENTS 1
 #endif
 
 #ifndef VIM_CASE_SENSITIVE_CHARACTER_SEEK
 #define VIM_CASE_SENSITIVE_CHARACTER_SEEK 1
-#endif
-
-#ifndef VIM_USE_CUSTOM_COLORS
-#define VIM_USE_CUSTOM_COLORS 0
 #endif
 
 #ifndef VIM_AUTO_INDENT_ON_PASTE
@@ -92,28 +96,32 @@
 #define VIM_MAXIMUM_OP_COUNT 256
 #endif
 
+#ifndef VIM_USE_CUSTOM_COLORS
+#define VIM_USE_CUSTOM_COLORS 0
+#endif
+
+#ifndef VIM_USE_CHARACTER_SEEK_HIGHLIGHTS
+#define VIM_USE_CHARACTER_SEEK_HIGHLIGHTS 1
+#endif
+
 #ifndef VIM_FILE_BAR_ON_BOTTOM
-#define VIM_FILE_BAR_ON_BOTTOM 1
+#define VIM_FILE_BAR_ON_BOTTOM 0
 #endif
 
 #ifndef VIM_DRAW_PANEL_MARGINS
-#define VIM_DRAW_PANEL_MARGINS 1 // 0: don't draw, 1: minimal vertical margins, 2: full margins
+#define VIM_DRAW_PANEL_MARGINS 2 // 0: don't draw, 1: minimal vertical margins, 2: full margins
 #endif
 
 #ifndef VIM_PANEL_MARGIN_THICKNESS
-#define VIM_PANEL_MARGIN_THICKNESS 2.0f
+#define VIM_PANEL_MARGIN_THICKNESS 3.0f
 #endif
 
 #ifndef VIM_USE_ECHO_BAR
-#define VIM_USE_ECHO_BAR 1
+#define VIM_USE_ECHO_BAR 0
 #endif
 
 #ifndef VIM_CURSOR_ROUNDNESS
 #define VIM_CURSOR_ROUNDNESS 0.9f
-#endif
-
-#ifndef VIM_AUTO_LINE_COMMENTS
-#define VIM_AUTO_LINE_COMMENTS 1
 #endif
 
 //
@@ -144,6 +152,7 @@
 // - Dead keys (needs support from Allen)
 // - Figure out how to change the size of the "global" region properly, so people can handle the echo bar.
 // - Edit autoindent proper instead of using my hacky function
+// - Figure out the right way to handle the view regions to make the echo bar and chin filebar not mess stuff up.
 
 //
 // Internal Defines
@@ -760,7 +769,7 @@ struct Vim_Global_State {
 
     u8                   echo_string_storage[256];
     String_u8            echo_string;
-    ARGB_Color           echo_color;
+    FColor               echo_color;
     f32                  persistent_echo_string_timeout;
     u8                   persistent_echo_string_storage[256];
     String_u8            persistent_echo_string;
@@ -859,7 +868,7 @@ internal void vim_echo_varargs(Application_Links* app, char* fmt, va_list args) 
 internal void vim_echo(Application_Links* app, char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    vim_state.echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+    vim_state.echo_color = fcolor_id(defcolor_text_default);
     vim_echo_varargs(app, fmt, args);
     va_end(args);
 }
@@ -867,7 +876,7 @@ internal void vim_echo(Application_Links* app, char* fmt, ...) {
 internal void vim_echo_alert(Application_Links* app, char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    vim_state.echo_color = finalize_color(defcolor_comment_pop, 0);
+    vim_state.echo_color = fcolor_id(defcolor_pop1);
     vim_echo_varargs(app, fmt, args);
     va_end(args);
 }
@@ -875,7 +884,7 @@ internal void vim_echo_alert(Application_Links* app, char* fmt, ...) {
 internal void vim_echo_error(Application_Links* app, char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    vim_state.echo_color = finalize_color(defcolor_comment_pop, 1);
+    vim_state.echo_color = fcolor_id(defcolor_pop2);
     vim_echo_varargs(app, fmt, args);
     va_end(args);
 }
@@ -4989,7 +4998,7 @@ function void vim_draw_echo_bar(Application_Links *app, Face_ID face_id, Rect_f3
     f32 digit_advance = face_metrics.decimal_digit_advance;
 
     draw_rectangle(app, bar, 0.0f, fcolor_resolve(fcolor_id(defcolor_back)));
-    draw_string_oriented(app, face_id, vim_state.echo_color, vim_state.echo_string.string, bar.p0 + V2f32(2.0f, 2.0f), 0, V2f32(1, 0));
+    draw_string_oriented(app, face_id, fcolor_resolve(vim_state.echo_color), vim_state.echo_string.string, bar.p0 + V2f32(2.0f, 2.0f), 0, V2f32(1, 0));
 
     // if (vim_state.recording_macro) {
     //     push_fancy_stringf(scratch, &list, pop2_color, "   recording @%c", vim_state.most_recent_macro_register);
@@ -5057,7 +5066,7 @@ function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_
     Managed_ID bar_color = defcolor_bar;
 
 #if VIM_USE_CUSTOM_COLORS
-    if (vim_state.recording_macro && VIM_USE_ECHO_BAR) {
+    if (vim_state.recording_macro) {
         bar_color = defcolor_vim_bar_recording_macro;
     } else {
         switch (vim_state.mode) {
@@ -5132,6 +5141,12 @@ function void vim_draw_file_bar(Application_Links *app, View_ID view_id, Buffer_
     b32 is_active_view = (active_view == view_id);
 
     if (is_active_view) {
+        if (vim_state.echo_string.size) {
+            push_fancy_string(scratch, &list, vim_state.echo_color, string_u8_litexpr("   << "));
+            push_fancy_string(scratch, &list, vim_state.echo_color, vim_state.echo_string.string);
+            push_fancy_string(scratch, &list, vim_state.echo_color, string_u8_litexpr(" >> "));
+        }
+
         if (vim_state.recording_macro) {
             push_fancy_stringf(scratch, &list, pop2_color, "   recording @%c", vim_state.most_recent_macro_register);
         }
@@ -5954,7 +5969,7 @@ internal void vim_init(Application_Links* app) {
     vim_state.search_direction = Scan_Forward;
     vim_state.chord_bar = Su8(vim_state.chord_bar_storage, 0, ArrayCount(vim_state.chord_bar_storage));
     vim_state.echo_string = Su8(vim_state.echo_string_storage, 0, ArrayCount(vim_state.echo_string_storage));
-    vim_state.echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+    vim_state.echo_color = fcolor_id(defcolor_text_default);
     vim_state.persistent_echo_string = Su8(vim_state.persistent_echo_string_storage, 0, ArrayCount(vim_state.persistent_echo_string_storage));
     vim_state.persistent_echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
 
