@@ -128,9 +128,6 @@
 //
 //
 
-// Important major changes:
-// - Make command repetition work by storing the command and the required motion / selection information to execute it rather than using macros
-
 // Things to do:
 // - Option to disable mouse during insert mode (to avoid stupid palming of my touchpad)
 // - Explore how to enable virtual whitespace with these vimmish things
@@ -153,6 +150,9 @@
 // - Figure out how to change the size of the "global" region properly, so people can handle the echo bar.
 // - Edit autoindent proper instead of using my hacky function
 // - Figure out the right way to handle the view regions to make the echo bar and chin filebar not mess stuff up.
+// - Think about the performance (or lack thereof) of selection drawing. Shit slows to a crawl.
+// - Rewrite the isearch functions a bit to make more sense, and make them echo alerts if a pattern is not found.
+// - Replace mode?
 
 //
 // Internal Defines
@@ -1353,6 +1353,7 @@ internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_
         if (matches_previous_sequence) {
             matches_previous_sequence = vim_keys_are_equal(key, prev_seq.keys[prev_seq_index++]);
             if (matches_previous_sequence && (prev_seq_index == prev_seq.count)) {
+                vim_retire_key(); // @ConsumeKeyOnSuccess
 #if VIM_PRINT_COMMANDS
                 vim_print_bind(app, &vim_text_object_line_bind);
 #endif
@@ -1858,7 +1859,8 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                     vim_state.first_insert_node = vim_state.last_insert_node = 0;
                     vim_insert_node_buffer_used = 0;
 
-                    // NOTE: Merge before processing so that a later merge won't shift around the memory of the strings
+                    // TODO: I feel like this comment is out of date and we don't have to do this because we copy out insert node text into a different buffer anyway.
+                    // (NOTE: Merge before processing so that a later merge won't shift around the memory of the strings)
                     buffer_history_merge_record_range(app, buffer, insert_history_index, current_history_index, RecordMergeFlag_StateInRange_MoveStateForward);
                     current_history_index = buffer_history_get_current_state_index(app, buffer);
 
@@ -2017,7 +2019,7 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_mode) {
     }
 
     if (vim_state.mode == VimMode_Visual) {
-        vim_enter_mode(app, VimMode_Normal, true);
+        vim_enter_mode(app, VimMode_Normal);
     } else {
         vim_enter_mode(app, VimMode_Visual);
     }
@@ -2037,7 +2039,7 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_line_mode) {
     }
 
     if (vim_state.mode == VimMode_VisualLine) {
-        vim_enter_mode(app, VimMode_Normal, true);
+        vim_enter_mode(app, VimMode_Normal);
     } else {
         vim_enter_mode(app, VimMode_VisualLine);
     }
@@ -2058,7 +2060,7 @@ CUSTOM_COMMAND_SIG(vim_toggle_visual_block_mode) {
     }
 
     if (vim_state.mode == VimMode_VisualBlock) {
-        vim_enter_mode(app, VimMode_Normal, true);
+        vim_enter_mode(app, VimMode_Normal);
     } else {
         vim_enter_mode(app, VimMode_VisualBlock);
     }
@@ -2152,28 +2154,28 @@ internal Vim_Text_Object_Result vim_execute_text_object(Application_Links* app, 
     return result;
 }
 
-internal Range_i64 vim_seek_motion_result(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion_Result mo_res) {
+internal Range_i64 vim_seek_motion_result(Application_Links* app, View_ID view, Buffer_ID buffer, Vim_Motion_Result mr) {
     i64 old_pos = view_get_cursor_pos(app, view);
-    i64 new_pos = mo_res.seek_pos;
+    i64 new_pos = mr.seek_pos;
 
-    Range_i64 result = mo_res.range_; // vim_apply_range_style(app, buffer, Ii64(old_pos, new_pos), mo_res.style);
+    Range_i64 result = mr.range_; // vim_apply_range_style(app, buffer, Ii64(old_pos, new_pos), mr.style);
 
     i64 old_line = get_line_number_from_pos(app, buffer, old_pos);
     i64 new_line = get_line_number_from_pos(app, buffer, new_pos);
 
-    if (HasFlag(mo_res.flags, VimMotionFlag_IsJump) && !HasFlag(mo_res.flags, VimMotionFlag_LogJumpPostSeek)) {
+    if (HasFlag(mr.flags, VimMotionFlag_IsJump) && !HasFlag(mr.flags, VimMotionFlag_LogJumpPostSeek)) {
         if (old_line != new_line) {
             vim_log_jump_history(app);
         }
     }
 
-    if (HasFlag(mo_res.flags, VimMotionFlag_SetPreferredX)) {
+    if (HasFlag(mr.flags, VimMotionFlag_SetPreferredX)) {
         view_set_cursor_and_preferred_x(app, view, seek_pos(new_pos));
     } else {
         view_set_cursor(app, view, seek_pos(new_pos));
     }
 
-    if (HasFlag(mo_res.flags, VimMotionFlag_IsJump) && HasFlag(mo_res.flags, VimMotionFlag_LogJumpPostSeek)) {
+    if (HasFlag(mr.flags, VimMotionFlag_IsJump) && HasFlag(mr.flags, VimMotionFlag_LogJumpPostSeek)) {
         vim_log_jump_history(app);
     }
 
