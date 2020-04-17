@@ -2,6 +2,9 @@
 
 #define VIM_USE_CUSTOM_COLORS 1
 #define VIM_CURSOR_ROUNDNESS 0.0f
+#define VIM_USE_ECHO_BAR 1
+#define VIM_DRAW_PANEL_MARGINS 1
+#define VIM_FILE_BAR_ON_BOTTOM 1
 
 #include "4coder_vimmish.cpp"
 

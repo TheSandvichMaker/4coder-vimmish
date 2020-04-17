@@ -159,7 +159,7 @@
 //
 
 #define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // NOTE: I don't really think this is good for my use, but it's here if you like things that complicate your life
-#define VIM_PRINT_COMMANDS 1
+#define VIM_PRINT_COMMANDS 0
 
 #define VIM_DEFAULT_BINDING_MAP_SLOT_COUNT 32
 #define VIM_DEFAULT_NESTED_BINDING_MAP_SLOT_COUNT 8
