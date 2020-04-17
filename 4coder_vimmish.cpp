@@ -1,6 +1,8 @@
 #ifndef FCODER_VIMMISH_CPP
 #define FCODER_VIMMISH_CPP
 
+// TODO: Make the list of user exposed defines in the usage comment up to date
+
 /* USAGE:
     #include "4coder_default_include.cpp"
 
@@ -118,7 +120,7 @@
 // - Make command repetition work by storing the command and the required motion / selection information to execute it rather than using macros
 
 // Things to do:
-// - Option to insert line comments on return
+// - Fix jump history across buffers
 // - Option to disable mouse during insert mode (to avoid stupid palming of my touchpad)
 // - People like that thing where they can use some textual key sequence to escape from insert mode, I don't really get it but I'm not against implementing it
 // - Explore how to enable virtual whitespace with these vimmish things
@@ -127,19 +129,18 @@
 // - vim_align_range breaks when aligning characters at the end of lines, it seems.
 // - Check for finnicky auto indent things (indenting one line more than expected, not indenting preprocessor defines properly)
 // - Make the miblo number things handle negative numbers and booleans
-// - Clamp left / right motions to line
 // - Support marks as motions
 // - Apparently, vim has some weird timing thing regarding conflicting binds. I've never noticed it, and it seems awful. But if you're weird, you could implement it.
 // - Check out what's going on with text objects with a count > 1
 // - Why does the word motion no longer stop on empty lines properly? Is it because of crlf line endings?
 // - Review what should go into the view attachment versus the buffer attachment versus the global state.
 // - Investigate: Next search gets caught on push_render_element in handmade_render_group.cpp
-// - Fix jump history across buffers
 // - Persistent echo
 // - Make ^N ^P style autocomplete with dropdown
 // - Search under cursor / search selection is bork sometimes. Why?
 // - Make my mind up about how to special case change ops that open a new line (cc, ci{, etc)
 // - Dead keys (needs support from Allen)
+// - Figure out how to change the size of the "global" region properly, so people can handle the echo bar.
 
 //
 // Internal Defines
@@ -191,6 +192,14 @@ global Vim_Binding_Map vim_map_operator_pending;
 
 internal b32 vim_character_is_newline(char c) {
     return c == '\r' || c == '\n';
+}
+
+internal void printf_message(Application_Links* app, char* fmt, ...) {
+    Scratch_Block scratch(app);
+    va_list args;
+    va_start(args, fmt);
+    print_message(app, push_stringfv(scratch, fmt, args));
+    va_end(args);
 }
 
 internal void vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
@@ -599,7 +608,7 @@ internal Vim_Key vim_key(
     Vim_Key result = {};
     result.kc = cast(u16) kc;
     result.mods = input_modifier_set_fixed_to_vim_modifiers(mods);
-
+    
     return result;
 }
 
@@ -876,18 +885,18 @@ struct Vim_View_Attachment {
 
     b32       dont_log_this_buffer_jump;
 
-    i32       jump_history_min;
-    i32       jump_history_one_past_max;
+    i32       jump_history_first;
+    i32       jump_history_one_past_last;
     i32       jump_history_cursor;
     Tiny_Jump jump_history[VIM_JUMP_HISTORY_SIZE];
 };
 
 internal void vim_delete_jump_history_at_index(Application_Links* app, Vim_View_Attachment* vim_view, i32 jump_index) {
-    if (jump_index >= vim_view->jump_history_min && jump_index < vim_view->jump_history_one_past_max) {
-        i32 jumps_left = vim_view->jump_history_one_past_max - jump_index;
+    if (jump_index >= vim_view->jump_history_first && jump_index < vim_view->jump_history_one_past_last) {
+        i32 jumps_left = vim_view->jump_history_one_past_last - jump_index;
 
-        vim_view->jump_history_one_past_max--;
-        vim_view->jump_history_cursor = Min(vim_view->jump_history_cursor, vim_view->jump_history_one_past_max);
+        vim_view->jump_history_one_past_last--;
+        vim_view->jump_history_cursor = Min(vim_view->jump_history_cursor, vim_view->jump_history_one_past_last);
 
         if (jumps_left > 1) {
             // @Speed
@@ -911,7 +920,7 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
     i64 line = get_line_number_from_pos(app, buffer, pos);
 
     Scratch_Block scratch(app);
-    for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
+    for (i32 jump_index = vim_view->jump_history_first; jump_index < vim_view->jump_history_one_past_last; jump_index++) {
         Tiny_Jump test_jump = ArraySafe(vim_view->jump_history, jump_index);
         if (test_jump.buffer == buffer) {
             i64 test_line = get_line_number_from_pos(app, buffer, test_jump.pos); // @Speed
@@ -928,9 +937,9 @@ internal void vim_log_jump_history_internal(Application_Links* app, View_ID view
 
     ArraySafe(vim_view->jump_history, vim_view->jump_history_cursor++) = jump;
 
-    vim_view->jump_history_one_past_max = vim_view->jump_history_cursor;
-    i32 unsafe_index = vim_view->jump_history_one_past_max - ArrayCount(vim_view->jump_history);
-    vim_view->jump_history_min = Max(0, Max(vim_view->jump_history_min, unsafe_index));
+    vim_view->jump_history_one_past_last = vim_view->jump_history_cursor;
+    i32 unsafe_index = vim_view->jump_history_one_past_last - ArrayCount(vim_view->jump_history);
+    vim_view->jump_history_first = Max(0, Max(vim_view->jump_history_first, unsafe_index));
 }
 
 internal void vim_log_jump_history(Application_Links* app) {
@@ -946,25 +955,20 @@ internal void vim_log_jump_history(Application_Links* app) {
 
 CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
     View_ID view = get_active_view(app, Access_Always);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
+    // Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
     Managed_Scope scope = view_get_managed_scope(app, view);
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
-#if 0
-    // NOTE: vim doesn't do this, but I feel like it's nice behaviour
-    if (vim_view->jump_history_cursor == vim_view->jump_history_one_past_max) {
-        vim_log_jump_history(app, false); // Passing false here would add the history only if the line doesn't have a jump yet, and it wouldn't advance the history cursor.
-    }
-#endif
-
-    if (vim_view->jump_history_cursor > vim_view->jump_history_min) {
-        Tiny_Jump jump = ArraySafe(vim_view->jump_history, vim_view->jump_history_cursor);
-        if (vim_view->jump_history_cursor == vim_view->jump_history_one_past_max && jump.buffer != buffer) {
+    if (vim_view->jump_history_cursor > vim_view->jump_history_first) {
+        if (vim_view->jump_history_cursor == vim_view->jump_history_one_past_last) {
+            i32 pre_jump_cursor = vim_view->jump_history_cursor;
             vim_log_jump_history(app);
-            --vim_view->jump_history_cursor;
+            vim_view->jump_history_cursor = pre_jump_cursor;
         }
-        --vim_view->jump_history_cursor;
+
+        Tiny_Jump jump = ArraySafe(vim_view->jump_history, --vim_view->jump_history_cursor);
         jump_to_location(app, view, jump.buffer, jump.pos);
+
         vim_view->dont_log_this_buffer_jump = true;
     }
 }
@@ -974,9 +978,10 @@ CUSTOM_COMMAND_SIG(vim_step_forward_jump_history) {
     Managed_Scope scope = view_get_managed_scope(app, view);
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
-    if (vim_view->jump_history_cursor + 1 < vim_view->jump_history_one_past_max) {
+    if (vim_view->jump_history_cursor + 1 < vim_view->jump_history_one_past_last) {
         Tiny_Jump jump = ArraySafe(vim_view->jump_history, ++vim_view->jump_history_cursor);
         jump_to_location(app, view, jump.buffer, jump.pos);
+
         vim_view->dont_log_this_buffer_jump = true;
     }
 }
@@ -1392,7 +1397,8 @@ internal void vim_begin_macro(Application_Links* app, u8 reg_char) {
     }
 
     Vim_Register* reg = vim_get_register(reg_char);
-    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) && (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
+    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) &&
+                              (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
     if (reg && reg_is_alphanumeric) {
         vim_state.recording_macro = true;
         vim_state.most_recent_macro_register = reg_char;
@@ -1409,7 +1415,8 @@ internal void vim_end_macro(Application_Links* app, u8 reg_char) {
     }
 
     Vim_Register* reg = vim_get_register(reg_char);
-    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) && (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
+    b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) &&
+                              (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
     if (reg && reg_is_alphanumeric) {
         vim_state.recording_macro = false;
         vim_state.most_recent_macro_register = reg_char;
@@ -1582,7 +1589,7 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
         case VimMode_VisualLine: {
             selection.kind = VimSelectionKind_Line;
             selection.range.first.col = 0;
-            selection.range.one_past_last.col = max_i32;
+            selection.range.one_past_last.col = -1;
         } break;
 
         case VimMode_VisualBlock: {
@@ -1596,7 +1603,7 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
             selection.range.first = buffer_compute_cursor(app, buffer, seek_line_col(selection.range.first.line, selection.range.first.col));
             selection.range.one_past_last = buffer_compute_cursor(app, buffer, seek_line_col(selection.range.one_past_last.line, selection.range.one_past_last.col));
             if (vim_state.visual_block_force_to_line_end) {
-                selection.range.one_past_last.col = max_i32;
+                selection.range.one_past_last.col = -1;
             }
         } break;
     }
@@ -3271,6 +3278,8 @@ function void vim_write_text(Application_Links *app, String_Const_u8 insert) {
 }
 
 internal void vim_write_text_and_auto_indent_internal(Application_Links* app, String_Const_u8 insert, i64 reference_line = -1) {
+    // TODO: This function is really a hack, and what I actually should do is edit the auto indentation stuff properly to do what I want.
+    //       But that's a lot of work. And this at least kind of works with non-cpp files (if I actually used it for mapid_file).
     // NOTE: reference_line is a thing because mixed line endings are ruining my life.
     if (insert.str != 0 && insert.size > 0) {
         b32 do_auto_indent = false;
@@ -3299,15 +3308,15 @@ internal void vim_write_text_and_auto_indent_internal(Application_Links* app, St
         if (do_auto_indent) {
             Range_i64 pos = {};
             pos.min = view_get_cursor_pos(app, view);
-            if (reference_line < 1) {
-                reference_line = get_line_number_from_pos(app, buffer, pos.min);
+            i64 line = reference_line;
+            if (line < 1) {
+                line = get_line_number_from_pos(app, buffer, pos.min);
             }
             vim_write_text(app, insert);
             pos.max = view_get_cursor_pos(app, view);
 
             if (open_new_line || preprocessor) {
                 Scratch_Block scratch(app);
-                i64 line = reference_line;
                 String_Const_u8 line_string = push_buffer_line(app, scratch, buffer, line);
                 i64 first_non_whitespace = string_find_first_non_whitespace(line_string);
                 String_Const_u8 indent_string = string_prefix(line_string, first_non_whitespace);
@@ -3586,6 +3595,24 @@ internal String_Const_u8 vim_cut_range(Application_Links* app, Arena* arena, Vie
     return result;
 }
 
+CUSTOM_COMMAND_SIG(vim_new_line_below) {
+    View_ID view = get_active_view(app, Access_ReadWriteVisible);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+
+    i64 pos = view_get_cursor_pos(app, view);
+    i64 line = get_line_number_from_pos(app, buffer, pos);
+
+    seek_end_of_textual_line(app);
+
+    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"), line);
+    vim_enter_insert_mode(app);
+}
+
+CUSTOM_COMMAND_SIG(vim_new_line_above) {
+    vim_move_up_textual(app);
+    vim_new_line_below(app);
+}
+
 enum Vim_DCY {
     VimDCY_Delete,
     VimDCY_Change,
@@ -3628,13 +3655,6 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
 
         if (mode == VimDCY_Delete || mode == VimDCY_Change) {
             yank_string = vim_cut_range(app, scratch, view, buffer, range);
-#if 0
-            if (line_range.min != line_range.max) {
-                if (mode == VimDCY_Change) {
-                    auto_indent_line_at_cursor(app);
-                }
-            }
-#endif
         } else {
             yank_string = push_buffer_range(app, scratch, buffer, range);
         }
@@ -3856,7 +3876,7 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
                 view_set_cursor_and_preferred_x(app, view, seek_pos(replace_range.min + paste_string.size - 1)); // @Unicode
             }
 #if VIM_AUTO_INDENT_ON_PASTE
-            auto_indent_buffer(app, buffer, Ii64_size(cursor.pos, paste_string.size));
+            auto_indent_buffer(app, buffer, Ii64_size(cursor.pos, paste_string.size - (contains_newlines ? 1 : 0)));
 #endif
             
             if (replaced_string.size) {
@@ -4095,24 +4115,6 @@ internal VIM_OPERATOR(vim_align_right) {
     vim_align_internal(app, state, view, buffer, selection, count, true);
 }
 
-CUSTOM_COMMAND_SIG(vim_new_line_below) {
-    View_ID view = get_active_view(app, Access_ReadWriteVisible);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
-
-    i64 pos = view_get_cursor_pos(app, view);
-    i64 line = get_line_number_from_pos(app, buffer, pos);
-
-    seek_end_of_textual_line(app);
-
-    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"), line);
-    vim_enter_insert_mode(app);
-}
-
-CUSTOM_COMMAND_SIG(vim_new_line_above) {
-    vim_move_up_textual(app);
-    vim_new_line_below(app);
-}
-
 internal void vim_join_line_internal(Application_Links* app, Buffer_ID buffer, i64 line) {
     i64 next_line = line + 1;
     if (is_valid_line(app, buffer, next_line)) {
@@ -4313,7 +4315,7 @@ CUSTOM_DOC("[vim] Reads a filename from surrounding '\"' characters and attempts
         String_Const_u8 file_name = push_buffer_file_name(app, scratch, buffer);
         String_Const_u8 path = string_remove_last_folder(file_name);
 
-        if (character_is_slash(string_get_character(path, path.size - 1))){
+        if (character_is_slash(string_get_character(path, path.size - 1))) {
             path = string_chop(path, 1);
         }
 
@@ -5231,6 +5233,12 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
     *insert_map_id_ptr = *map_id_ptr;
     *map_id_ptr = vim_mapid_normal;
 
+    local_persist b32 warned_virtual_whitespace = false;
+    if (!warned_virtual_whitespace && global_config.enable_virtual_whitespace) {
+        vim_echo_alert(app, "Warning: Virtual Whitespace is not yet properly supported by 4coder_vimmish.");
+        warned_virtual_whitespace = true;
+    }
+
     return 0;
 }
 
@@ -5524,7 +5532,7 @@ BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
     for (View_ID view = get_view_next(app, 0, Access_Read); view; view = get_view_next(app, view, Access_Read)) {
         Managed_Scope scope = view_get_managed_scope(app, view);
         Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
-        for (i32 jump_index = vim_view->jump_history_min; jump_index < vim_view->jump_history_one_past_max; jump_index++) {
+        for (i32 jump_index = vim_view->jump_history_first; jump_index < vim_view->jump_history_one_past_last; jump_index++) {
             Tiny_Jump* jump = vim_view->jump_history + (jump_index % ArrayCount(vim_view->jump_history));
             if (jump->buffer == buffer_id) {
                 // @TODO: Make it look at the line instead
