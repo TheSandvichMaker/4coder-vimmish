@@ -158,6 +158,9 @@
        0, 0, instance, 0
    );
 */
+// - Cut down on difficult to understand interactions of code, such as vim_enter_visual_insert_mode setting your cursor, 
+//   the numerous odd behaviours of vim_delete_change_or_yank, and more.
+// - Handle writables on repeats
 
 //
 // Internal Defines
@@ -500,15 +503,21 @@ struct Vim_Command_Rep {
     Vim_Command_Rep_Kind kind;
     i32 count;
     b32 count_was_set;
+
+    u8 writable_1_size;
+    u8 writable_2_size;
+    u8 writable_1[4];
+    u8 writable_2[4];
+
     union {
         struct {
-            i32 motion_count;
-            b32 motion_count_was_set;
-            Vim_Motion* motion;
-            Vim_Text_Object* text_object;
+            i32                  motion_count;
+            b32                  motion_count_was_set;
+            Vim_Motion*          motion;
+            Vim_Text_Object*     text_object;
             Vim_Visual_Selection selection;
-            Vim_Register* reg;
-            Vim_Operator* op;
+            Vim_Register*        reg;
+            Vim_Operator*        op;
         };
         Custom_Command_Function* fcoder_command;
     };
@@ -716,6 +725,14 @@ struct Vim_Global_State {
     Vim_Key_Sequence     current_key_sequence;
 
     union {
+        Tiny_Jump all_marks[26 + 26];        
+        struct {
+            Tiny_Jump lower_marks[26]; // 'a-'z
+            Tiny_Jump upper_marks[26]; // 'A-'Z
+        };
+    };
+
+    union {
         Vim_Register alphanumeric_registers[26 + 10];
         struct {
             Vim_Register alpha_registers[26];   // "a-"z
@@ -728,14 +745,6 @@ struct Vim_Global_State {
     Vim_Register         last_search_register;  // "/
     Vim_Register*        active_register;
 
-    union {
-        Tiny_Jump all_marks[26 + 26];        
-        struct {
-            Tiny_Jump lower_marks[26]; // 'a-'z
-            Tiny_Jump upper_marks[26]; // 'A-'Z
-        };
-    };
-
     u8                   most_recent_macro_register;
     u8                   recording_macro_register;
     b32                  played_macro;
@@ -745,8 +754,8 @@ struct Vim_Global_State {
     
     b32                  executing_queried_motion;
     
-    Vim_Command_Rep      next_command_rep;
-    Vim_Command_Rep      command_rep;
+    Vim_Command_Rep*     next_command_rep;
+    Vim_Command_Rep*     command_rep;
     b32                  command_in_progress;
     b32                  playing_back_command;
     History_Group        command_history;
@@ -779,6 +788,8 @@ struct Vim_Global_State {
     u8                   persistent_echo_string_storage[256];
     String_u8            persistent_echo_string;
     ARGB_Color           persistent_echo_color;
+
+    u32                  stored_writables_queried;
 };
 
 global Vim_Global_State vim_state;
@@ -1156,8 +1167,30 @@ internal User_Input vim_get_next_keystroke(Application_Links* app) {
 }
 
 internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
-    User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
-    String_Const_u8 result = to_writable(&in);
+    String_Const_u8 result = SCu8();
+    if (vim_state.playing_back_command) {
+        Assert(vim_state.stored_writables_queried < 2);
+        if (vim_state.stored_writables_queried == 0) {
+            result = SCu8(vim_state.command_rep->writable_1, vim_state.command_rep->writable_1_size);
+        } else if (vim_state.stored_writables_queried == 1) {
+            result = SCu8(vim_state.command_rep->writable_2, vim_state.command_rep->writable_2_size);
+        }
+        ++vim_state.stored_writables_queried;
+    } else {
+        User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+        result = to_writable(&in);
+        Assert(vim_state.stored_writables_queried < 2);
+        Assert(result.size <= 4);
+        if (vim_state.stored_writables_queried == 0) {
+            block_copy(vim_state.next_command_rep->writable_1, result.str, result.size);
+            vim_state.next_command_rep->writable_1_size = cast(u8) result.size;
+        } else if (vim_state.stored_writables_queried == 1) {
+            block_copy(vim_state.next_command_rep->writable_2, result.str, result.size);
+            vim_state.next_command_rep->writable_2_size = cast(u8) result.size;
+        }
+        ++vim_state.stored_writables_queried;
+    }
+
     if (vim_state.capture_queries_into_chord_bar) {
         vim_append_chord_bar(result, 0);
     }
@@ -1251,6 +1284,7 @@ inline void vim_begin_query(Application_Links* app, Vim_Query_Mode mode) {
     vim_state.current_key_sequence.count = 0;
     vim_state.current_key_is_retired = false;
     vim_state.current_key = vim_get_key_from_input_query(app, mode);
+    vim_state.stored_writables_queried = 0;
 }
 
 inline void vim_end_query() {
@@ -1763,7 +1797,7 @@ internal void vim_begin_command(Application_Links* app, Buffer_ID buffer, Vim_Ke
             vim_state.command_history = history_group_begin(app, buffer);
             vim_state.command_in_progress = true;
 
-            Vim_Command_Rep* rep = &vim_state.next_command_rep;
+            Vim_Command_Rep* rep = vim_state.next_command_rep;
             block_zero_struct(rep);
             rep->count = count;
             rep->count_was_set = count_was_set;
@@ -1796,7 +1830,7 @@ internal void vim_end_command(Application_Links* app, b32 command_was_complete) 
         history_group_end(vim_state.command_history);
         vim_state.command_in_progress = false;
         if (command_was_complete) {
-            vim_state.command_rep = vim_state.next_command_rep;
+            Swap(Vim_Command_Rep*, vim_state.command_rep, vim_state.next_command_rep);
         }
     }
 }
@@ -3552,7 +3586,7 @@ internal b32 vim_get_operator_range(Vim_Operator_State* state, Range_i64* out_ra
                     }
                 }
 
-                Vim_Command_Rep* rep = &vim_state.next_command_rep;
+                Vim_Command_Rep* rep = vim_state.next_command_rep;
                 if (rep->kind == VimCommandRep_Operator) {
                     rep->motion_count = state->motion_count;
                     rep->motion_count_was_set = state->motion_count_was_set;
@@ -4240,7 +4274,7 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
     print_message(app, string_u8_litexpr("Repeating Command.\n"));
 #endif
 
-    Vim_Command_Rep* rep = &vim_state.command_rep;
+    Vim_Command_Rep* rep = vim_state.command_rep;
     
     Vim_Visual_Selection selection = rep->selection;
     
@@ -6015,6 +6049,9 @@ internal void vim_init(Application_Links* app) {
     vim_state.echo_color = fcolor_id(defcolor_text_default);
     vim_state.persistent_echo_string = Su8(vim_state.persistent_echo_string_storage, 0, ArrayCount(vim_state.persistent_echo_string_storage));
     vim_state.persistent_echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+
+    vim_state.next_command_rep = push_array(&vim_state.arena, Vim_Command_Rep, 1);
+    vim_state.command_rep      = push_array(&vim_state.arena, Vim_Command_Rep, 1);
 
     if (sizeof(VIM_ESCAPE_SEQUENCE) != 0 && sizeof(VIM_ESCAPE_SEQUENCE) != 3) {
         vim_echo_alert(app, "Warning: Only two-character escape sequences are supported.");
