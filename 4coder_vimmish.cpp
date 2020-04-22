@@ -4091,8 +4091,6 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
         String_Match match = buffer_seek_string(app, buffer, align_target, Scan_Forward, seek_range.min);
         if (match.buffer == buffer && HasFlag(match.flags, StringMatch_CaseSensitive)) {
             if (align_after_target) {
-                // NOTE: Offset the seek position to skip over the range of the matched string, just in case for some reason
-                // the user asked to align a string with spaces in it, I guess.
                 i64 range_delta = range_size(match.range) - 1;
                 match.range.min += range_delta;
                 match.range.max += range_delta;
@@ -4132,8 +4130,8 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
             align_cursor = buffer_compute_cursor(app, buffer, seek_line_col(align_cursor.line, align_cursor.col));
 
             if (!align_after_target) {
+                i64 line_end = get_line_end_pos(app, buffer, align_cursor.line);
                 i64 post_target = align_cursor.pos + align_target.size;
-                i64 line_end = get_line_end_pos_from_pos(app, buffer, align_cursor.pos);
                 String_Match match = buffer_seek_character_class(app, buffer, &character_predicate_non_whitespace, Scan_Forward, post_target);
                 if (match.buffer == buffer && match.range.max < line_end) {
                     buffer_replace_range(app, buffer, Ii64(post_target + 1, match.range.min), SCu8());
