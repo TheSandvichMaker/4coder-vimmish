@@ -504,6 +504,7 @@ struct Vim_Command_Rep {
     i32 count;
     b32 count_was_set;
 
+    // TODO: Optimize this struct a little?
     u8 writable_1_size;
     u8 writable_2_size;
     u8 writable_1[4];
@@ -1643,7 +1644,7 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
 
         case VimMode_VisualLine: {
             selection.kind = VimSelectionKind_Line;
-            selection.range.first.col = 0;
+            selection.range.first.col = 1;
             selection.range.one_past_last.col = max_i32;
         } break;
 
@@ -1665,8 +1666,7 @@ internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID 
 
     selection.range.one_past_last.line++;
     selection.range.one_past_last.pos++;
-
-    if (selection.range.one_past_last.col > 0) selection.range.one_past_last.col++;
+    selection.range.one_past_last.col++;
 
     return selection;
 }
@@ -4064,30 +4064,28 @@ internal VIM_OPERATOR(vim_outdent) {
 }
 
 internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64 line_range, Range_i64 col_range, String_Const_u8 align_target, b32 align_after_target) {
-    // @TODO: If you want, you could rewrite this to use Batch_Edit and such or something. I didn't know it existed. Also just push a buffer line instead of buffer_seek
     if (col_range.min == 0 && col_range.max == 0) {
-        col_range = Ii64(0, max_i64);
+        col_range = Ii64(1, max_i64);
     }
 
     if (string_match(align_target, string_u8_litexpr(" "))) {
         align_after_target = true;
     }
 
-    i64 line_range_size = range_size_inclusive(line_range);
-
     Scratch_Block scratch(app);
-    Buffer_Cursor* align_cursors = push_array(scratch, Buffer_Cursor, line_range_size);
+    u32 align_cursor_count = 0;
+    Buffer_Cursor* align_cursors = push_array(scratch, Buffer_Cursor, range_size(line_range));
     Buffer_Cursor furthest_align_cursor = { -1, -1, -1 };
 
     b32 found_align_target = false;
     b32 did_align = false;
 
-    for (i64 line_index = 0; line_index < line_range_size; line_index++) {
-        i64 line_number = line_range.min + line_index;
-
-        Range_i64 col_pos_range = Ii64(buffer_compute_cursor(app, buffer, seek_line_col(line_number, col_range.min)).pos,
-                                       buffer_compute_cursor(app, buffer, seek_line_col(line_number, col_range.max)).pos);
-        Range_i64 seek_range = range_intersect(get_line_pos_range(app, buffer, line_number), col_pos_range);
+    for (i64 line = line_range.min; line < line_range.max; ++line) {
+        Range_i64 col_pos_range = Ii64(buffer_compute_cursor(app, buffer, seek_line_col(line, col_range.min)).pos,
+                                       buffer_compute_cursor(app, buffer, seek_line_col(line, col_range.max)).pos);
+        i64 first_non_whitespace = get_pos_past_lead_whitespace_from_line_number(app, buffer, line);
+        i64 line_end = get_line_end_pos(app, buffer, line);
+        Range_i64 seek_range = range_intersect(Ii64(first_non_whitespace, line_end), col_pos_range);
 
         i64 align_pos = -1;
         String_Match match = buffer_seek_string(app, buffer, align_target, Scan_Forward, seek_range.min);
@@ -4108,7 +4106,7 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
 
         if (align_pos != -1) {
             Buffer_Cursor align_cursor = buffer_compute_cursor(app, buffer, seek_pos(align_pos));
-            align_cursors[line_index] = align_cursor;
+            align_cursors[align_cursor_count++] = align_cursor;
 
             found_align_target = true;
 
@@ -4122,33 +4120,30 @@ internal b32 vim_align_range(Application_Links* app, Buffer_ID buffer, Range_i64
             if (align_cursor.col > furthest_align_cursor.col) {
                 furthest_align_cursor = align_cursor;
             }
-        } else {
-            align_cursors[line_index] = { -1, -1, -1 };
         }
     }
 
     if (did_align) {
         History_Group history = history_group_begin(app, buffer);
-        for (i64 line_index = 0; line_index < line_range_size; line_index++) {
-            Buffer_Cursor align_cursor = align_cursors[line_index];
+        for (i64 i = 0; i < align_cursor_count; ++i) {
+            Buffer_Cursor align_cursor = align_cursors[i];
 
-            if (align_cursor.col != -1) {
-                // Note: We have to recompute the cursor because by inserting indentation we adjust the absolute pos of the alignment point
-                align_cursor = buffer_compute_cursor(app, buffer, seek_line_col(align_cursor.line, align_cursor.col));
+            // Note: We have to recompute the cursor because by inserting indentation we adjust the absolute pos of the alignment point
+            align_cursor = buffer_compute_cursor(app, buffer, seek_line_col(align_cursor.line, align_cursor.col));
 
-                if (!align_after_target) {
-                    i64 post_target = align_cursor.pos + align_target.size;
-                    String_Match match = buffer_seek_character_class(app, buffer, &character_predicate_non_whitespace, Scan_Forward, post_target);
-                    if (match.buffer == buffer) {
-                        buffer_replace_range(app, buffer, Ii64(post_target + 1, match.range.min), SCu8());
-                    }
+            if (!align_after_target) {
+                i64 post_target = align_cursor.pos + align_target.size;
+                i64 line_end = get_line_end_pos_from_pos(app, buffer, align_cursor.pos);
+                String_Match match = buffer_seek_character_class(app, buffer, &character_predicate_non_whitespace, Scan_Forward, post_target);
+                if (match.buffer == buffer && match.range.max < line_end) {
+                    buffer_replace_range(app, buffer, Ii64(post_target + 1, match.range.min), SCu8());
                 }
+            }
 
-                i64 col_delta = furthest_align_cursor.col - align_cursor.col;
-                if (col_delta > 0) {
-                    String_Const_u8 align_string = push_u8_stringf(scratch, "%*s", col_delta, "");
-                    buffer_replace_range(app, buffer, Ii64(align_cursor.pos), align_string);
-                }
+            i64 col_delta = furthest_align_cursor.col - align_cursor.col;
+            if (col_delta > 0) {
+                String_Const_u8 align_string = push_u8_stringf(scratch, "%*s", col_delta, "");
+                buffer_replace_range(app, buffer, Ii64(align_cursor.pos), align_string);
             }
         }
         history_group_end(history);
@@ -4327,11 +4322,11 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
         view_set_cursor_and_preferred_x(app, view, seek_pos(end_pos));
     }
     
-    vim_enter_normal_mode(app);
-    
     if (is_vim_visual_mode(vim_state.mode)) {
         view_set_cursor_and_preferred_x(app, view, seek_line_col(selection.range.first.line, selection.range.first.col));
     }
+    
+    vim_enter_normal_mode(app);
     
     vim_state.playing_back_command = false;
 
