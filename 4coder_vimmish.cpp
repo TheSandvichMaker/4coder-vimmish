@@ -155,8 +155,6 @@
 // - Replace mode?
 // - Word motion got caught on the following:
 /*
- 0, 0, instance, 0
-);*
        0, 0, instance, 0
    );
 */
@@ -739,7 +737,7 @@ struct Vim_Global_State {
     };
 
     u8                   most_recent_macro_register;
-    b32                  recording_macro;
+    u8                   recording_macro_register;
     b32                  played_macro;
     i64                  current_macro_start_pos;
     i64                  command_start_pos;
@@ -1413,7 +1411,7 @@ internal Vim_Register* vim_query_and_set_register(Application_Links* app, Vim_Bi
 }
 
 internal void vim_begin_macro(Application_Links* app, u8 reg_char) {
-    if (vim_state.recording_macro) {
+    if (vim_state.recording_macro_register) {
         return;
     }
 
@@ -1421,8 +1419,7 @@ internal void vim_begin_macro(Application_Links* app, u8 reg_char) {
     b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) &&
                               (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
     if (reg && reg_is_alphanumeric) {
-        vim_state.recording_macro = true;
-        vim_state.most_recent_macro_register = reg_char;
+        vim_state.recording_macro_register = reg_char;
 
         Buffer_ID buffer = get_keyboard_log_buffer(app);
         Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(buffer_get_size(app, buffer)));
@@ -1430,18 +1427,16 @@ internal void vim_begin_macro(Application_Links* app, u8 reg_char) {
     }
 }
 
-internal void vim_end_macro(Application_Links* app, u8 reg_char) {
-    if (!vim_state.recording_macro) {
+internal void vim_end_macro(Application_Links* app) {
+    if (!vim_state.recording_macro_register) {
         return;
     }
 
-    Vim_Register* reg = vim_get_register(reg_char);
+    Vim_Register* reg = vim_get_register(vim_state.recording_macro_register);
     b32 reg_is_alphanumeric = (reg >= vim_state.alphanumeric_registers) &&
                               (reg < vim_state.alphanumeric_registers + ArrayCount(vim_state.alphanumeric_registers));
+    vim_state.recording_macro_register = 0;
     if (reg && reg_is_alphanumeric) {
-        vim_state.recording_macro = false;
-        vim_state.most_recent_macro_register = reg_char;
-
         Buffer_ID buffer = get_keyboard_log_buffer(app);
 
         i64 end_macro_pos = vim_state.command_start_pos;
@@ -1460,8 +1455,8 @@ CUSTOM_COMMAND_SIG(vim_record_macro) {
 
     if (!buffer_exists(app, buffer)) return;
 
-    if (vim_state.recording_macro && vim_state.most_recent_macro_register) {
-        vim_end_macro(app, vim_state.most_recent_macro_register);
+    if (vim_state.recording_macro_register) {
+        vim_end_macro(app);
     } else {
         String_Const_u8 reg_str = vim_get_next_writable(app);
         if (reg_str.size) {
@@ -1489,6 +1484,13 @@ CUSTOM_COMMAND_SIG(vim_replay_macro) {
         Vim_Register* reg = vim_get_register(reg_char);
         if (reg) {
             String_Const_u8 macro_string = vim_read_register(app, reg);
+            if (vim_state.recording_macro_register) {
+                u8 rec_reg_char = character_to_upper(vim_state.recording_macro_register);
+                vim_end_macro(app);
+                Vim_Register* rec_reg = vim_get_register(rec_reg_char);
+                vim_write_register(app, rec_reg, macro_string);
+                vim_begin_macro(app, rec_reg_char);
+            }
             keyboard_macro_play(app, macro_string);
 
             vim_state.most_recent_macro_register = reg_char;
