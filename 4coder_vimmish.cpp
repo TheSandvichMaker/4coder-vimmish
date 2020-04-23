@@ -166,7 +166,6 @@
 // Internal Defines
 //
 
-#define VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD 0 // NOTE: I don't really think this is good for my use, but it's here if you like things that complicate your life
 #define VIM_PRINT_COMMANDS 0
 
 #define VIM_DEFAULT_BINDING_MAP_SLOT_COUNT 32
@@ -222,18 +221,22 @@ internal void printf_message(Application_Links* app, char* fmt, ...) {
     va_end(args);
 }
 
-internal void vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
+enum Vim_DynString_Mode {
+    VimDynString_Compact,
+    VimDynString_Generous,
+};
+
+internal void vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source, Vim_DynString_Mode mode = VimDynString_Compact) {
     u64 new_cap = 0;
 
-#if VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD
-    if (dest->cap < source.size || dest->cap > 4*source.size) {
-        new_cap = 2*source.size;
-    }
-#else
     if (dest->cap < source.size) {
-        new_cap = source.size;
+        if (mode == VimDynString_Generous) {
+            new_cap = 2*source.size;
+        } else {
+            Assert(mode == VimDynString_Compact);
+            new_cap = source.size;
+        }
     }
-#endif
 
     if (new_cap) {
         new_cap = Max(256, new_cap);
@@ -254,20 +257,19 @@ internal void vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, St
     block_copy(dest->str, source.str, source.size);
 }
 
-internal String_Const_u8 vim_string_append_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source) {
+internal String_Const_u8 vim_string_append_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source, Vim_DynString_Mode mode = VimDynString_Compact) {
     u64 result_size = dest->size + source.size;
 
     u64 new_cap = 0;
 
-#if VIM_DYNAMIC_STRINGS_ARE_TOO_CLEVER_FOR_THEIR_OWN_GOOD
-    if (dest->cap < result_size || dest->cap > 4*result_size) {
-        new_cap = 2*result_size;
+    if (dest->cap < source.size) {
+        if (mode == VimDynString_Generous) {
+            new_cap = 2*source.size;
+        } else {
+            Assert(mode == VimDynString_Compact);
+            new_cap = source.size;
+        }
     }
-#else
-    if (dest->cap < result_size) {
-        new_cap = result_size;
-    }
-#endif
 
     if (new_cap) {
         new_cap = Max(256, new_cap);
@@ -722,6 +724,7 @@ struct Vim_Global_State {
     b32                  right_justify_visual_insert;
     Range_i64            visual_insert_line_range;
 
+    String_u8            insert_node_buffer;
     Vim_Insert_Node*     first_insert_node;
     Vim_Insert_Node*     last_insert_node;
     Vim_Insert_Node*     first_free_insert_node;
@@ -890,7 +893,7 @@ internal Vim_Writable_Node* vim_push_writable(String_Const_u8 writable) {
     vim_state.first_free_writable = node->next;
 
     Vim_Command_Rep* rep = vim_state.next_command_rep;
-    node->writable = vim_string_append_dynamic(&vim_state.alloc, &rep->writables_buffer, writable);
+    node->writable = vim_string_append_dynamic(&vim_state.alloc, &rep->writables_buffer, writable, VimDynString_Generous);
     sll_queue_push(rep->first_writable, rep->last_writable, node);
 
     return node;
@@ -1008,7 +1011,6 @@ internal void vim_log_jump_history(Application_Links* app) {
 
 CUSTOM_COMMAND_SIG(vim_step_back_jump_history) {
     View_ID view = get_active_view(app, Access_Always);
-    // Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
     Managed_Scope scope = view_get_managed_scope(app, view);
     Vim_View_Attachment* vim_view = scope_attachment(app, scope, vim_view_attachment, Vim_View_Attachment);
 
@@ -1199,7 +1201,9 @@ internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
     } else {
         User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
         result = to_writable(&in);
-        vim_push_writable(result);
+        if (vim_state.command_in_progress) {
+            vim_push_writable(result);
+        }
     }
 
     if (vim_state.capture_queries_into_chord_bar) {
@@ -1728,15 +1732,15 @@ internal void vim_rel_move(Application_Links* app, Buffer_Seek seek) {
     view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
 }
 
-// @TODO: Replace this random global buffer?
-global u32 vim_insert_node_buffer_used;
-global u8 vim_insert_node_buffer[KB(2)];
+internal String_u8 vim_dynamic_string(Base_Allocator* alloc, size_t initial_size) {
+    String_u8 result = {};
+    Data mem = base_allocate(alloc, initial_size);
+    result.str = cast(u8*) mem.data;
+    result.cap = mem.size;
+    return result;
+}
 
 internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app, Buffer_ID buffer, Record_Info record, Buffer_Cursor insert_cursor) {
-    if (vim_insert_node_buffer_used == sizeof(vim_insert_node_buffer)) {
-        return 0;
-    }
-
     if (!vim_state.first_free_insert_node) {
         vim_state.first_free_insert_node = push_array(&vim_state.arena, Vim_Insert_Node, 1);
         vim_state.first_free_insert_node->next = 0;
@@ -1754,25 +1758,8 @@ internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app
     String_Const_u8 fwd = record.single_string_forward;
     String_Const_u8 bck = record.single_string_backward;
 
-    Assert((vim_insert_node_buffer_used + fwd.size + bck.size) < sizeof(vim_insert_node_buffer));
-
-    {
-        u8* buffer_pos = vim_insert_node_buffer + vim_insert_node_buffer_used;
-        u32 buffer_left = sizeof(vim_insert_node_buffer) - vim_insert_node_buffer_used;
-        u32 size = Min(cast(u32) fwd.size, buffer_left);
-        block_copy(buffer_pos, fwd.str, size);
-        vim_insert_node_buffer_used += cast(u32) size;
-        node->text_forward = SCu8(buffer_pos, size);
-    }
-
-    {
-        u8* buffer_pos = vim_insert_node_buffer + vim_insert_node_buffer_used;
-        u32 buffer_left = sizeof(vim_insert_node_buffer) - vim_insert_node_buffer_used;
-        u32 size = Min(cast(u32) bck.size, buffer_left);
-        block_copy(buffer_pos, bck.str, size);
-        vim_insert_node_buffer_used += cast(u32) size;
-        node->text_backward = SCu8(buffer_pos, size);
-    }
+    node->text_forward  = vim_string_append_dynamic(&vim_state.alloc, &vim_state.insert_node_buffer, fwd, VimDynString_Generous);
+    node->text_backward = vim_string_append_dynamic(&vim_state.alloc, &vim_state.insert_node_buffer, bck, VimDynString_Generous);
 
     return node;
 }
@@ -1928,7 +1915,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                     
                     vim_state.first_free_insert_node = vim_state.first_insert_node;
                     vim_state.first_insert_node = vim_state.last_insert_node = 0;
-                    vim_insert_node_buffer_used = 0;
+                    vim_state.insert_node_buffer.size = 0;
 
                     // TODO: I feel like this comment is out of date and we don't have to do this because we copy out insert node text into a different buffer anyway.
                     // (NOTE: Merge before processing so that a later merge won't shift around the memory of the strings)
@@ -4180,7 +4167,9 @@ internal String_Const_u8 vim_query_string(Application_Links* app, char* flavour_
         sll_stack_pop(vim_state.current_queued_writable);
     } else {
         result = get_query_string(app, flavour_text, buffer, sizeof(buffer));
-        vim_push_writable(result);
+        if (vim_state.command_in_progress) {
+            vim_push_writable(result);
+        }
     }
     return result;
 }
@@ -6096,6 +6085,8 @@ internal void vim_init(Application_Links* app) {
     vim_state.echo_color = fcolor_id(defcolor_text_default);
     vim_state.persistent_echo_string = Su8(vim_state.persistent_echo_string_storage, 0, ArrayCount(vim_state.persistent_echo_string_storage));
     vim_state.persistent_echo_color = fcolor_resolve(fcolor_id(defcolor_text_default));
+
+    vim_state.insert_node_buffer = vim_dynamic_string(&vim_state.alloc, KB(2));
 
     vim_state.next_command_rep = push_array_zero(&vim_state.arena, Vim_Command_Rep, 1);
     vim_state.command_rep      = push_array_zero(&vim_state.arena, Vim_Command_Rep, 1);
