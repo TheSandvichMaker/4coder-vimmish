@@ -10,6 +10,22 @@
 
 #include "generated/managed_id_metadata.cpp"
 
+CUSTOM_COMMAND_SIG(sandvich_startup)
+{
+    ProfileScope(app, "sandvich startup");
+    User_Input input = get_current_input(app);
+    if (match_core_code(&input, CoreCode_Startup)){
+        String_Const_u8_Array file_names = input.event.core.file_names;
+        load_themes_default_folder(app);
+        default_4coder_initialize(app, file_names);
+        default_4coder_side_by_side_panels(app, file_names);
+        if (global_config.automatically_load_project){
+            load_project(app);
+        }
+        toggle_fullscreen(app);
+    }
+}
+
 void custom_layer_init(Application_Links *app) {
     Thread_Context* tctx = get_thread_context(app);
 
@@ -31,4 +47,11 @@ void custom_layer_init(Application_Links *app) {
 
     vim_add_abbreviation("breka", "break");
     vim_add_abbreviation("ture", "true");
+
+    {
+        MappingScope();
+        SelectMapping(&framework_mapping);
+        SelectMap(mapid_global);
+        BindCore(sandvich_startup, CoreCode_Startup);
+    }
 }
