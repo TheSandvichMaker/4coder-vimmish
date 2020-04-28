@@ -167,6 +167,7 @@
 // Internal Defines
 //
 
+#define VIM_USE_EXPERIMENTAL_AUTO_INDENT 0
 #define VIM_INSERT_NODE_BUFFER_SIZE KB(4)
 #define VIM_WRITABLE_BUFFER_SIZE KB(2)
 #define VIM_PRINT_COMMANDS 0
@@ -3361,7 +3362,40 @@ function void vim_write_text(Application_Links *app, String_Const_u8 insert) {
     }
 }
 
-internal void vim_write_text_and_auto_indent_internal(Application_Links* app, String_Const_u8 insert, i64 reference_line = -1) {
+internal void vim_write_text_and_auto_indent_internal(Application_Links* app, String_Const_u8 insert) {
+    ProfileScope(app, "write and auto indent");
+    if (insert.str != 0 && insert.size > 0){
+        b32 do_auto_indent = false;
+        for (u64 i = 0; !do_auto_indent && i < insert.size; i += 1){
+            switch (insert.str[i]){
+                case ';': case ':':
+                case '{': case '}':
+                case '(': case ')':
+                case '[': case ']':
+                case '#':
+                case '\n': case '\t':
+                {
+                    do_auto_indent = true;
+                }break;
+            }
+        }
+        if (do_auto_indent){
+            View_ID view = get_active_view(app, Access_ReadWriteVisible);
+            Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+            Range_i64 pos = {};
+            pos.min = view_get_cursor_pos(app, view);
+            write_text(app, insert);
+            pos.max= view_get_cursor_pos(app, view);
+            auto_indent_buffer(app, buffer, pos, 0);
+            move_past_lead_whitespace(app, view, buffer);
+        }
+        else{
+            write_text(app, insert);
+        }
+    }
+}
+
+internal void vim_write_text_and_auto_indent_internal_experimental(Application_Links* app, String_Const_u8 insert, i64 reference_line = -1) {
     // TODO: This function is really a hack, and what I actually should do is edit the auto indentation stuff properly to do what I want.
     //       But that's a lot of work. And this at least kind of works with non-cpp files (if I actually used it for mapid_file).
     // NOTE: reference_line is a thing because mixed line endings are ruining my life.
@@ -3414,6 +3448,13 @@ internal void vim_write_text_and_auto_indent_internal(Application_Links* app, St
                         full_auto_indent = true;
                     } else {
                         b32 line_contains_open_scope = false;
+                        u8 last_char_on_line = 0;
+                        for (u8* c = line_string.str + line_string.size - 1; c > line_string.str; --c) {
+                            if (character_is_alpha_numeric(*c)) {
+                                last_char_on_line = *c;
+                                break;
+                            }
+                        }
                         switch (line_string.str[line_string.size - 1]) {
                             case '{':
                             case '[':
@@ -3681,7 +3722,12 @@ CUSTOM_COMMAND_SIG(vim_new_line_below) {
 
     seek_end_of_textual_line(app);
 
-    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"), line);
+#if VIM_USE_EXPERIMENTAL_AUTO_INDENT
+    vim_write_text_and_auto_indent_internal_experimental(app, string_u8_litexpr("\n"), line);
+#else
+    (void)line;
+    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+#endif
     vim_enter_insert_mode(app);
 }
 
@@ -3695,7 +3741,12 @@ CUSTOM_COMMAND_SIG(vim_new_line_above) {
     seek_beginning_of_textual_line(app);
     move_left(app);
 
-    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"), line);
+#if VIM_USE_EXPERIMENTAL_AUTO_INDENT
+    vim_write_text_and_auto_indent_internal_experimental(app, string_u8_litexpr("\n"), line);
+#else
+    (void)line;
+    vim_write_text_and_auto_indent_internal(app, string_u8_litexpr("\n"));
+#endif
     vim_enter_insert_mode(app);
 }
 
@@ -4761,7 +4812,11 @@ CUSTOM_DOC("[vim] Inserts text and auto-indents the line on which the cursor sit
         }
     }
 
+#if VIM_USE_EXPERIMENTAL_AUTO_INDENT
+    vim_write_text_and_auto_indent_internal_experimental(app, insert);
+#else
     vim_write_text_and_auto_indent_internal(app, insert);
+#endif
     vim_state.insert_sequence_pos = view_get_cursor_pos(app, view);
 }
 
