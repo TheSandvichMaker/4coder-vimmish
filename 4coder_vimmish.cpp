@@ -160,8 +160,7 @@
 */
 // - Cut down on difficult to understand interactions of code, such as vim_enter_visual_insert_mode setting your cursor, 
 //   the numerous odd behaviours of vim_delete_change_or_yank, and more.
-// - Store string queries for command repeat
-// - Visual Insert Repeat
+// - Why does vim_previous_buffer not work. Does the command get called?
 
 //
 // Internal Defines
@@ -820,6 +819,9 @@ struct Vim_Global_State {
     u8                   persistent_echo_string_storage[256];
     String_u8            persistent_echo_string;
     ARGB_Color           persistent_echo_color;
+
+    u32 insert_node_buffer_used;
+    u8 insert_node_buffer[VIM_INSERT_NODE_BUFFER_SIZE];
 };
 
 global Vim_Global_State vim_state;
@@ -1750,11 +1752,8 @@ internal void vim_rel_move(Application_Links* app, Buffer_Seek seek) {
     view_set_cursor_and_preferred_x(app, view, seek_pos(pos));
 }
 
-global u32 vim_insert_node_buffer_used;
-global u8 vim_insert_node_buffer[VIM_INSERT_NODE_BUFFER_SIZE];
-
 internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app, Buffer_ID buffer, Record_Info record, Buffer_Cursor insert_cursor) {
-    if (vim_insert_node_buffer_used == ArrayCount(vim_insert_node_buffer)) {
+    if (vim_state.insert_node_buffer_used == ArrayCount(vim_state.insert_node_buffer)) {
         return 0;
     }
 
@@ -1775,8 +1774,8 @@ internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app
     String_Const_u8 fwd = record.single_string_forward;
     String_Const_u8 bck = record.single_string_backward;
 
-    node->text_forward  = vim_push_string_buffer(ArrayCount(vim_insert_node_buffer), &vim_insert_node_buffer_used, vim_insert_node_buffer, fwd);
-    node->text_backward = vim_push_string_buffer(ArrayCount(vim_insert_node_buffer), &vim_insert_node_buffer_used, vim_insert_node_buffer, bck);
+    node->text_forward  = vim_push_string_buffer(ArrayCount(vim_state.insert_node_buffer), &vim_state.insert_node_buffer_used, vim_state.insert_node_buffer, fwd);
+    node->text_backward = vim_push_string_buffer(ArrayCount(vim_state.insert_node_buffer), &vim_state.insert_node_buffer_used, vim_state.insert_node_buffer, bck);
 
     return node;
 }
@@ -1797,7 +1796,7 @@ internal void vim_apply_abbreviations_for_range(Application_Links* app, View_ID 
         Scratch_Block scratch(app);
         String_Const_u8 word = push_buffer_range(app, scratch, buffer, word_range);
 
-        // @TODO: Maybe consider creating some cool acceleration structure for this. Or not. Should be profiled, I guess.
+        // @TODO: Maybe consider creating some cool acceleration structure for this. Or not. Depends on how many abbrevs you got.
         for (Vim_Abbreviation* abbreviation = vim_state.first_abbreviation; abbreviation; abbreviation = abbreviation->next) {
             if (string_match(word, abbreviation->match)) {
                 buffer_replace_range(app, buffer, word_range, abbreviation->replacement);
@@ -1927,19 +1926,20 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                 History_Record_Index insert_history_index = vim_state.insert_history_index;
                 History_Record_Index current_history_index = buffer_history_get_current_state_index(app, buffer);
 
-                if (!vim_state.playing_back_command && insert_history_index <= current_history_index) {
+                if (insert_history_index < current_history_index) {
                     did_insert = true;
                     
                     vim_state.first_free_insert_node = vim_state.first_insert_node;
                     vim_state.first_insert_node = vim_state.last_insert_node = 0;
-                    vim_insert_node_buffer_used = 0;
+                    vim_state.insert_node_buffer_used = 0;
 
-                    // TODO: I feel like this comment is out of date and we don't have to do this because we copy out insert node text into a different buffer anyway.
-                    // (NOTE: Merge before processing so that a later merge won't shift around the memory of the strings)
-                    buffer_history_merge_record_range(app, buffer, insert_history_index, current_history_index, RecordMergeFlag_StateInRange_MoveStateForward);
+                    History_Record_Index first_valid_history_index = insert_history_index + 1;
+
+                    // Merge records now to condense the insert nodes we will create.
+                    buffer_history_merge_record_range(app, buffer, first_valid_history_index, current_history_index, RecordMergeFlag_StateInRange_MoveStateForward);
                     current_history_index = buffer_history_get_current_state_index(app, buffer);
 
-                    for (i32 history_index = insert_history_index; history_index <= current_history_index; history_index++) {
+                    for (i32 history_index = first_valid_history_index; history_index <= current_history_index; history_index++) {
                         Record_Info record = buffer_history_get_record_info(app, buffer, history_index);
                         if (record.kind == RecordKind_Group) {
                             for (i32 sub_index = 0; sub_index < record.group_count; sub_index++) {
@@ -1963,6 +1963,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                 }
 
                 History_Group history = history_group_begin(app, buffer);
+                --history.first;
                 if (nodes_occupy_first_line) {
                     Range_i64 line_range = vim_state.visual_insert_line_range;
                     for (i64 line = line_range.first + 1; line < line_range.one_past_last; line++) {
@@ -2009,7 +2010,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
                 move_past_lead_whitespace(app, view);
             }
         } case VimMode_Insert: {
-            vim_state.insert_history_index = buffer_history_get_current_state_index(app, buffer) + 1;
+            vim_state.insert_history_index = buffer_history_get_current_state_index(app, buffer);
             vim_state.insert_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
             vim_state.character_seek_show_highlight = false;
         } break;
@@ -2074,13 +2075,13 @@ CUSTOM_COMMAND_SIG(vim_enter_insert_sol_mode) {
 }
 
 CUSTOM_COMMAND_SIG(vim_enter_append_mode) {
-    vim_enter_mode(app, VimMode_Insert);
     vim_rel_move(app, seek_line_col(0, 1));
+    vim_enter_mode(app, VimMode_Insert);
 }
 
 CUSTOM_COMMAND_SIG(vim_enter_append_eol_mode) {
-    vim_enter_mode(app, VimMode_Insert);
     seek_end_of_line(app);
+    vim_enter_mode(app, VimMode_Insert);
 }
 
 CUSTOM_COMMAND_SIG(vim_toggle_visual_mode) {
@@ -5460,7 +5461,6 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
     for (View_ID view = get_view_next(app, 0, Access_ReadVisible); view; view = get_view_next(app, view, Access_ReadVisible)) {
         Buffer_ID buffer = view_get_buffer(app, view, Access_ReadVisible);
         if (buffer_exists(app, buffer)) {
-            Buffer_ID scratch_buffer = get_buffer_by_name(app, string_u8_litexpr("*scratch*"), Access_Always);
             Managed_Scope view_scope = view_get_managed_scope(app, view);
             Vim_View_Attachment* vim_view = scope_attachment(app, view_scope, vim_view_attachment, Vim_View_Attachment);
             
@@ -5478,8 +5478,7 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
             }
             
             if (vim_view->most_recent_known_buffer &&
-                vim_view->most_recent_known_buffer != buffer &&
-                vim_view->most_recent_known_buffer != scratch_buffer)
+                vim_view->most_recent_known_buffer != buffer)
             {
                 vim_state.insert_sequence = false;
                 if (vim_view->dont_log_this_buffer_jump) {
@@ -6134,8 +6133,8 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimAddParentMap(vim_map_normal);
     VimAddParentMap(vim_map_text_objects);
     
-    VimBind(vim_enter_visual_insert_mode,                        vim_char('I'));
-    VimBind(vim_enter_visual_append_mode,                        vim_char('A'));
+    VimBind(vim_enter_visual_insert_mode,                        vim_char('I'))->flags |= VimBindingFlag_TextCommand;
+    VimBind(vim_enter_visual_append_mode,                        vim_char('A'))->flags |= VimBindingFlag_TextCommand;
 
     VimBind(vim_lowercase,                                       vim_char('u'));
     VimBind(vim_uppercase,                                       vim_char('U'));
