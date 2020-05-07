@@ -2008,7 +2008,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             } else {
                 vim_state.right_justify_visual_insert = false;
                 view_set_cursor_and_preferred_x(app, view, seek_line_col(selection.first_line, selection.first_col));
-                move_past_lead_whitespace(app, view);
+                // move_past_lead_whitespace(app, view); // WHAT'S THIS DOING HERE????
             }
         } case VimMode_Insert: {
             vim_state.insert_history_index = buffer_history_get_current_state_index(app, buffer);
@@ -3819,7 +3819,9 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
     if (mode == VimDCY_Change && did_act) {
         if (selection.kind == VimSelectionKind_Line || selection.kind == VimSelectionKind_Block) {
             set_cursor = false;
-            auto_indent_line_at_cursor(app);
+            if (selection.kind == VimSelectionKind_Line) {
+                auto_indent_line_at_cursor(app);
+            }
             vim_enter_visual_insert_mode(app);
         } else {
             // @TODO: This still seems like a gross solution
