@@ -910,10 +910,11 @@ internal Vim_Writable_Node* vim_push_writable(String_Const_u8 writable) {
         vim_state.first_free_writable->next = 0;
     }
     Vim_Writable_Node* node = vim_state.first_free_writable;
-    vim_state.first_free_writable = node->next;
+    sll_stack_pop(vim_state.first_free_writable);
 
     Vim_Command_Rep* rep = vim_state.next_command_rep;
     node->writable = vim_push_string_buffer(ArrayCount(rep->writable_buffer), &rep->writable_buffer_used, rep->writable_buffer, writable);
+
     sll_queue_push(rep->first_writable, rep->last_writable, node);
 
     return node;
@@ -1762,9 +1763,7 @@ internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app
         vim_state.first_free_insert_node->next = 0;
     }
     Vim_Insert_Node* node = vim_state.first_free_insert_node;
-    vim_state.first_free_insert_node = vim_state.first_free_insert_node->next;
-
-    sll_queue_push(vim_state.first_insert_node, vim_state.last_insert_node, node);
+    sll_stack_pop(vim_state.first_free_insert_node);
 
     Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(record.single_first));
 
@@ -1776,6 +1775,8 @@ internal Vim_Insert_Node* vim_add_insert_node_from_record(Application_Links* app
 
     node->text_forward  = vim_push_string_buffer(ArrayCount(vim_state.insert_node_buffer), &vim_state.insert_node_buffer_used, vim_state.insert_node_buffer, fwd);
     node->text_backward = vim_push_string_buffer(ArrayCount(vim_state.insert_node_buffer), &vim_state.insert_node_buffer_used, vim_state.insert_node_buffer, bck);
+
+    sll_queue_push(vim_state.first_insert_node, vim_state.last_insert_node, node);
 
     return node;
 }
