@@ -5167,7 +5167,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
     vim_draw_cursor(app, view_id, is_active_view, buffer, text_layout_id, cursor_roundness, mark_thickness, vim_state.mode);
 
     // NOTE(allen): Fade ranges
-    paint_fade_ranges(app, text_layout_id, buffer, view_id);
+    paint_fade_ranges(app, text_layout_id, buffer);
 
     // NOTE(allen): put the actual text on the actual screen
     draw_text_layout_default(app, text_layout_id);
@@ -5499,6 +5499,119 @@ function void vim_tick(Application_Links *app, Frame_Info frame_info) {
     }
 }
 
+internal b32 vim_handle_input(Application_Links* app, Buffer_ID buffer, View_ID view) {
+    b32 result = false;
+
+    i32 op_count = 1;
+    b32 op_count_was_set = false;
+    Vim_Key_Binding* vim_bind = 0;
+    if (!is_vim_insert_mode(vim_state.mode)) {
+        Vim_Binding_Map* map = vim_get_map_for_mode(vim_state.mode);
+
+        if (map && map->allocator) {
+            vim_begin_query(app, VimQuery_CurrentInput);
+
+            vim_query_and_set_register(app, map);
+
+            op_count = 1;
+            op_count_was_set = false;
+            if (!is_vim_insert_mode(vim_state.mode)) {
+                i64 queried_number = vim_query_number(app);
+                op_count = cast(i32) clamp(1, queried_number, max_i32);
+                op_count_was_set = (queried_number != 0);
+            }
+
+            vim_query_and_set_register(app, map);
+
+            vim_bind = vim_query_binding(app, map, false);
+        }
+    }
+
+    if (vim_bind) {
+        result = true;
+        Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
+
+        if (HasFlag(vim_bind->flags, VimBindingFlag_WriteOnly)) {
+            u32 buffer_flags = buffer_get_access_flags(app, buffer);
+            if (!HasFlag(buffer_flags, Access_Write)) {
+                return result;
+            }
+        }
+
+        vim_begin_command(app, buffer, vim_bind, op_count, op_count_was_set, selection);
+
+        switch (vim_bind->kind) {
+            case VimBindingKind_Motion: {
+                vim_state.character_seek_show_highlight = false;
+                
+                Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, vim_bind->motion, view_get_cursor_pos(app, view), op_count, op_count_was_set);
+                vim_seek_motion_result(app, view, buffer, mr);
+
+                if (HasFlag(mr.flags, VimMotionFlag_SetPreferredX)) {
+                    vim_state.visual_block_force_to_line_end = HasFlag(mr.flags, VimMotionFlag_VisualBlockForceToLineEnd);
+                }
+            } break;
+
+            case VimBindingKind_TextObject: {
+                vim_state.character_seek_show_highlight = false;
+
+                Vim_Text_Object_Result tor = vim_execute_text_object(app, view, buffer, vim_bind->text_object, view_get_cursor_pos(app, view), op_count, op_count_was_set);
+
+                Vim_Mode new_mode = VimMode_Visual;
+                if (tor.style == VimRangeStyle_Linewise) {
+                    new_mode = VimMode_VisualLine;
+                }
+
+                if (vim_state.mode != new_mode) {
+                    vim_enter_mode(app, new_mode);
+                }
+
+                vim_select_range(app, view, tor.range);
+            } break;
+
+            case VimBindingKind_Operator: {
+                Vim_Operator_State op_state = {};
+                op_state.app          = app;
+                op_state.view         = view;
+                op_state.buffer       = buffer;
+                op_state.op_count     = op_count;
+                op_state.op           = vim_bind->op;
+                op_state.motion_count = 1;
+                op_state.selection    = selection;
+                op_state.total_range  = Ii64_neg_inf;
+
+                vim_bind->op(app, &op_state, view, buffer, selection, op_count, op_count_was_set);
+            } break;
+
+            case VimBindingKind_4CoderCommand: {
+                for (i32 i = 0; i < Min(op_count, VIM_MAXIMUM_OP_COUNT); i++) {
+                    vim_bind->fcoder_command(app);
+                }
+            } break;
+        }
+
+        view = get_active_view(app, Access_ReadVisible);
+        buffer = view_get_buffer(app, view, Access_ReadVisible);
+
+        if (vim_bind->kind == VimBindingKind_Operator) {
+            if (is_vim_visual_mode(vim_state.mode)) {
+                view_set_cursor_and_preferred_x(app, view, seek_line_col(selection.first_line, selection.first_col));
+                vim_enter_normal_mode(app);
+            }
+        }
+
+        if (vim_state.mode == VimMode_Normal) {
+            vim_end_command(app, true);
+        }
+
+        vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
+    }
+
+    vim_end_query();
+
+    return result;
+}
+
 CUSTOM_COMMAND_SIG(vim_default_view_handler)
 CUSTOM_DOC("[vim] Input consumption loop for view behavior")
 {
@@ -5546,146 +5659,24 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
         Managed_Scope buffer_scope = buffer_get_managed_scope(app, buffer);
 
         Command_Map_ID* map_id_ptr = scope_attachment(app, buffer_scope, buffer_map_id, Command_Map_ID);
+        if (*map_id_ptr == 0) {
+            *map_id_ptr = mapid_file;
+        }
         Command_Map_ID map_id = *map_id_ptr;
 
-        Command_Binding binding = map_get_binding_recursive(&framework_mapping, map_id, &input.event);
-        
-        i32 op_count = 1;
-        b32 op_count_was_set = false;
-        Vim_Key_Binding* vim_bind = 0;
-        if (!is_vim_insert_mode(vim_state.mode)) {
-            Vim_Binding_Map* map = vim_get_map_for_mode(vim_state.mode);
+        b32 vim_binding_handled = vim_handle_input(app, buffer, view);
 
-            if (map && map->allocator) {
-                vim_begin_query(app, VimQuery_CurrentInput);
-
-                vim_query_and_set_register(app, map);
-
-                op_count = 1;
-                op_count_was_set = false;
-                if (!is_vim_insert_mode(vim_state.mode)) {
-                    i64 queried_number = vim_query_number(app);
-                    op_count = cast(i32) clamp(1, queried_number, max_i32);
-                    op_count_was_set = (queried_number != 0);
-                }
-
-                vim_query_and_set_register(app, map);
-
-                vim_bind = vim_query_binding(app, map, false);
-            }
-        }
-
-        if (!binding.custom && !vim_bind) {
-            // NOTE(allen): we don't have anything to do with this input,
-            // leave it marked unhandled so that if there's a follow up
-            // event it is not blocked.
-            leave_current_input_unhandled(app);
-        } else {
-            // NOTE(allen): before the command is called do some book keeping
-            Rewrite_Type *next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
-            *next_rewrite = Rewrite_None;
-            if (fcoder_mode == FCoderMode_NotepadLike) {
-                for (View_ID view_it = get_view_next(app, 0, Access_Always);
-                     view_it != 0;
-                     view_it = get_view_next(app, view_it, Access_Always))
-                {
-                    Managed_Scope scope_it = view_get_managed_scope(app, view_it);
-                    b32 *snap_mark_to_cursor = scope_attachment(app, scope_it, view_snap_mark_to_cursor, b32);
-                    *snap_mark_to_cursor = true;
-                }
-            }
-
-            ProfileCloseNow(view_input_profile);
-
-            if (vim_bind) {
-                Vim_Visual_Selection selection = vim_get_selection(app, view, buffer);
-
-                if (HasFlag(vim_bind->flags, VimBindingFlag_WriteOnly)) {
-                    u32 buffer_flags = buffer_get_access_flags(app, buffer);
-                    if (!HasFlag(buffer_flags, Access_Write)) {
-                        return;
-                    }
-                }
-
-                vim_begin_command(app, buffer, vim_bind, op_count, op_count_was_set, selection);
-
-                switch (vim_bind->kind) {
-                    case VimBindingKind_Motion: {
-                        vim_state.character_seek_show_highlight = false;
-                        
-                        Vim_Motion_Result mr = vim_execute_motion(app, view, buffer, vim_bind->motion, view_get_cursor_pos(app, view), op_count, op_count_was_set);
-                        vim_seek_motion_result(app, view, buffer, mr);
-
-                        if (HasFlag(mr.flags, VimMotionFlag_SetPreferredX)) {
-                            vim_state.visual_block_force_to_line_end = HasFlag(mr.flags, VimMotionFlag_VisualBlockForceToLineEnd);
-                        }
-                    } break;
-
-                    case VimBindingKind_TextObject: {
-                        vim_state.character_seek_show_highlight = false;
-
-                        Vim_Text_Object_Result tor = vim_execute_text_object(app, view, buffer, vim_bind->text_object, view_get_cursor_pos(app, view), op_count, op_count_was_set);
-
-                        Vim_Mode new_mode = VimMode_Visual;
-                        if (tor.style == VimRangeStyle_Linewise) {
-                            new_mode = VimMode_VisualLine;
-                        }
-
-                        if (vim_state.mode != new_mode) {
-                            vim_enter_mode(app, new_mode);
-                        }
-
-                        vim_select_range(app, view, tor.range);
-                    } break;
-
-                    case VimBindingKind_Operator: {
-                        Vim_Operator_State op_state = {};
-                        op_state.app          = app;
-                        op_state.view         = view;
-                        op_state.buffer       = buffer;
-                        op_state.op_count     = op_count;
-                        op_state.op           = vim_bind->op;
-                        op_state.motion_count = 1;
-                        op_state.selection    = selection;
-                        op_state.total_range  = Ii64_neg_inf;
-
-                        vim_bind->op(app, &op_state, view, buffer, selection, op_count, op_count_was_set);
-                    } break;
-
-                    case VimBindingKind_4CoderCommand: {
-                        for (i32 i = 0; i < Min(op_count, VIM_MAXIMUM_OP_COUNT); i++) {
-                            vim_bind->fcoder_command(app);
-                        }
-                    } break;
-                }
-
-                view = get_active_view(app, Access_ReadVisible);
-                buffer = view_get_buffer(app, view, Access_ReadVisible);
-
-                if (vim_bind->kind == VimBindingKind_Operator) {
-                    if (is_vim_visual_mode(vim_state.mode)) {
-                        view_set_cursor_and_preferred_x(app, view, seek_line_col(selection.first_line, selection.first_col));
-                        vim_enter_normal_mode(app);
-                    }
-                }
-
-                if (vim_state.mode == VimMode_Normal) {
-                    vim_end_command(app, true);
-                }
-
-                vim_state.active_register = &vim_state.VIM_DEFAULT_REGISTER;
+        if (!vim_binding_handled) {
+            Command_Binding binding = map_get_binding_recursive(&framework_mapping, map_id, &input.event);
+            if (binding.custom == 0) {
+                // NOTE(allen): we don't have anything to do with this input,
+                // leave it marked unhandled so that if there's a follow up
+                // event it is not blocked.
+                leave_current_input_unhandled(app);
             } else {
-                // NOTE(allen): call the command
-                binding.custom(app);
-            }
-
-            // NOTE(allen): after the command is called do some book keeping
-            ProfileScope(app, "after view input");
-
-            next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
-            if (next_rewrite != 0) {
-                Rewrite_Type *rewrite = scope_attachment(app, view_scope, view_rewrite_loc, Rewrite_Type);
-                *rewrite = *next_rewrite;
+                // NOTE(allen): before the command is called do some book keeping
+                Rewrite_Type *next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
+                *next_rewrite = Rewrite_None;
                 if (fcoder_mode == FCoderMode_NotepadLike) {
                     for (View_ID view_it = get_view_next(app, 0, Access_Always);
                          view_it != 0;
@@ -5693,26 +5684,48 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
                     {
                         Managed_Scope scope_it = view_get_managed_scope(app, view_it);
                         b32 *snap_mark_to_cursor = scope_attachment(app, scope_it, view_snap_mark_to_cursor, b32);
-                        if (*snap_mark_to_cursor) {
-                            i64 pos = view_get_cursor_pos(app, view_it);
-                            view_set_mark(app, view_it, seek_pos(pos));
+                        *snap_mark_to_cursor = true;
+                    }
+                }
+
+                ProfileCloseNow(view_input_profile);
+
+                // NOTE(allen): call the command
+                binding.custom(app);
+
+                // NOTE(allen): after the command is called do some book keeping
+                ProfileScope(app, "after view input");
+
+                next_rewrite = scope_attachment(app, view_scope, view_next_rewrite_loc, Rewrite_Type);
+                if (next_rewrite != 0) {
+                    Rewrite_Type *rewrite = scope_attachment(app, view_scope, view_rewrite_loc, Rewrite_Type);
+                    *rewrite = *next_rewrite;
+                    if (fcoder_mode == FCoderMode_NotepadLike) {
+                        for (View_ID view_it = get_view_next(app, 0, Access_Always);
+                             view_it != 0;
+                             view_it = get_view_next(app, view_it, Access_Always))
+                        {
+                            Managed_Scope scope_it = view_get_managed_scope(app, view_it);
+                            b32 *snap_mark_to_cursor = scope_attachment(app, scope_it, view_snap_mark_to_cursor, b32);
+                            if (*snap_mark_to_cursor) {
+                                i64 pos = view_get_cursor_pos(app, view_it);
+                                view_set_mark(app, view_it, seek_pos(pos));
+                            }
                         }
                     }
                 }
             }
         }
-
-        vim_end_query();
     }
 }
 
 BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
-    default_buffer_edit_range(app, buffer_id, new_range, original_size);
+    default_buffer_edit_range(app, buffer_id, new_range, old_cursor_range);
 
     ProfileScope(app, "[vim] buffer edit range");
     
-    Range_i64 old_range = Ii64(new_range.first, new_range.first + original_size);
-    // Range_i64 old_line_range = get_line_range_from_pos_range(app, buffer_id, old_range);
+    Range_i64 old_range = Ii64(old_cursor_range.first.pos, old_cursor_range.one_past_last.pos);
+    Range_i64 old_line_range = Ii64(old_cursor_range.first.line, old_cursor_range.one_past_last.line);
 
     i64 insert_size = range_size(new_range);
     i64 text_shift = replace_range_shift(old_range, insert_size);

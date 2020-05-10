@@ -8,7 +8,9 @@
 
 #include "4coder_vimmish.cpp"
 
+#if !defined(META_PASS)
 #include "generated/managed_id_metadata.cpp"
+#endif
 
 CUSTOM_COMMAND_SIG(sandvich_startup)
 {
@@ -36,6 +38,11 @@ void custom_layer_init(Application_Links *app) {
     default_framework_init(app);
     set_all_default_hooks(app);
     mapping_init(tctx, &framework_mapping);
+#if OS_MAC
+    setup_mac_mapping(&framework_mapping, mapid_global, mapid_file, mapid_code);
+#else
+    setup_default_mapping(&framework_mapping, mapid_global, mapid_file, mapid_code);
+#endif
 
     //
     // Vim Layer Initialization
@@ -45,13 +52,13 @@ void custom_layer_init(Application_Links *app) {
     vim_set_default_hooks(app);
     vim_setup_default_mapping(app, &framework_mapping, vim_key(KeyCode_Space));
 
-    vim_add_abbreviation("breka", "break");
-    vim_add_abbreviation("ture", "true");
+    // vim_add_abbreviation("breka", "break");
+    // vim_add_abbreviation("ture", "true");
 
-    {
-        MappingScope();
-        SelectMapping(&framework_mapping);
-        SelectMap(mapid_global);
-        BindCore(sandvich_startup, CoreCode_Startup);
-    }
+    // {
+    //     MappingScope();
+    //     SelectMapping(&framework_mapping);
+    //     SelectMap(mapid_global);
+    //     BindCore(sandvich_startup, CoreCode_Startup);
+    // }
 }
