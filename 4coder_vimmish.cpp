@@ -27,7 +27,9 @@
 
     // You could add your own operators / motions.
 
+    #if !defined(META_PASS)
     #include "generated/managed_id_metadata.cpp"
+    #endif
 
     void custom_layer_init(Application_Links *app) {
         Thread_Context *tctx = get_thread_context(app);
@@ -1350,7 +1352,7 @@ internal i64 vim_query_number(Application_Links* app, b32 handle_sign = false) {
     i64 result = 0;
     Vim_Key key = vim_get_current_key(app);
 
-    if (!key.codepoint) {
+    if (key.mods || !key.codepoint) {
         return result;
     }
 
@@ -1360,7 +1362,7 @@ internal i64 vim_query_number(Application_Links* app, b32 handle_sign = false) {
         key = vim_get_next_key(app);
     }
 
-    if (!key.codepoint) {
+    if (key.mods || !key.codepoint) {
         return result;
     }
 
@@ -5724,8 +5726,18 @@ BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
 
     ProfileScope(app, "[vim] buffer edit range");
     
-    Range_i64 old_range = Ii64(old_cursor_range.first.pos, old_cursor_range.one_past_last.pos);
-    Range_i64 old_line_range = Ii64(old_cursor_range.first.line, old_cursor_range.one_past_last.line);
+    Range_i64 old_range = Ii64(old_cursor_range.min.pos, old_cursor_range.max.pos);
+    Range_i64 old_line_range = Ii64(old_cursor_range.min.line, old_cursor_range.max.line);
+
+#if 0
+    Buffer_ID keyboard_buffer = get_keyboard_log_buffer(app);
+    Buffer_ID message_buffer = get_buffer_by_name(app, string_u8_litexpr("*messages*"), Access_Always);
+
+    if (buffer_id != message_buffer && buffer_id != keyboard_buffer) {
+        Scratch_Block scratch(app);
+        print_message(app, push_u8_stringf(scratch, "Old Line Range: %d - %d\n", old_line_range.min, old_line_range.max));
+    }
+#endif
 
     i64 insert_size = range_size(new_range);
     i64 text_shift = replace_range_shift(old_range, insert_size);
@@ -5747,10 +5759,7 @@ BUFFER_EDIT_RANGE_SIG(vim_default_buffer_edit_range) {
         for (i32 jump_index = vim_view->jump_history_first; jump_index < vim_view->jump_history_one_past_last; jump_index++) {
             Tiny_Jump* jump = vim_view->jump_history + (jump_index % ArrayCount(vim_view->jump_history));
             if (jump->buffer == buffer_id) {
-                // @TODO: Make it look at the line instead
-                // i64 line = get_line_number_from_pos(app, buffer_id, jump->pos);
-                // if (text_shift < 0 && range_contains(old_line_range, line)) {
-                if (text_shift < 0 && range_contains(old_range, jump->pos)) {
+                if (text_shift < 0 && range_size(old_line_range) > 0 && range_contains(old_range, jump->pos)) {
                     vim_delete_jump_history_at_index(app, vim_view, jump_index);
                 } else if (new_range.min < jump->pos) {
                     jump->pos += text_shift;

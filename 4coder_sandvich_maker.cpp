@@ -52,13 +52,13 @@ void custom_layer_init(Application_Links *app) {
     vim_set_default_hooks(app);
     vim_setup_default_mapping(app, &framework_mapping, vim_key(KeyCode_Space));
 
-    // vim_add_abbreviation("breka", "break");
-    // vim_add_abbreviation("ture", "true");
+    vim_add_abbreviation("breka", "break");
+    vim_add_abbreviation("ture", "true");
 
-    // {
-    //     MappingScope();
-    //     SelectMapping(&framework_mapping);
-    //     SelectMap(mapid_global);
-    //     BindCore(sandvich_startup, CoreCode_Startup);
-    // }
+    {
+        MappingScope();
+        SelectMapping(&framework_mapping);
+        SelectMap(mapid_global);
+        BindCore(sandvich_startup, CoreCode_Startup);
+    }
 }
