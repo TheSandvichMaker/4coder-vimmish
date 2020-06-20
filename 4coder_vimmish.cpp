@@ -1153,6 +1153,30 @@ internal User_Input vim_get_next_keystroke(Application_Links* app) {
     return in;
 }
 
+// TODO: I shouldn't need my own version once the official version of this function is fixed
+internal User_Input vim_get_next_input(Application_Links *app, Event_Property use_flags, Event_Property abort_flags){
+    User_Input in = {};
+    if (use_flags != 0){
+        for (;;){
+            in = get_next_input_raw(app);
+            if (in.abort){
+                break;
+            }
+            Event_Property event_flags = get_event_properties(&in.event);
+            if ((event_flags & abort_flags) != 0){
+                in.abort = true;
+                leave_current_input_unhandled(app);
+                break;
+            }
+            if ((event_flags & use_flags) != 0){
+                break;
+            }
+            leave_current_input_unhandled(app);
+        }
+    }
+    return(in);
+}
+
 internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
     String_Const_u8 result = SCu8();
     if (vim_state.playing_back_command) {
@@ -1160,7 +1184,7 @@ internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
         result = vim_state.current_queued_writable->writable;
         sll_stack_pop(vim_state.current_queued_writable);
     } else {
-        User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+        User_Input in = vim_get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
         result = to_writable(&in);
         if (vim_state.command_in_progress) {
             vim_push_writable(result);
@@ -1950,16 +1974,6 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
 
     vim_select_mapid_for_mode(app, buffer, mode);
     vim_state.mode = mode;
-}
-
-CUSTOM_COMMAND_SIG(vim_test_writables)
-CUSTOM_DOC("TEST IT!")
-{
-    User_Input in = get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_Exit);
-    String_Const_u8 writable = to_writable(&in);
-    print_message(app, string_u8_litexpr("Writable: "));
-    print_message(app, writable);
-    print_message(app, string_u8_litexpr("\n"));
 }
 
 CUSTOM_COMMAND_SIG(vim_enter_normal_mode_escape) {
