@@ -143,12 +143,12 @@
 // - Make ^N ^P style autocomplete with dropdown
 // - Search under cursor / search selection is bork sometimes. Why?
 // - Make my mind up about how to special case change ops that open a new line (cc, ci{, etc)
-// - Dead keys (needs support from Allen)
 // - Figure out how to change the size of the "global" region properly, so people can handle the echo bar.
 // - Edit autoindent proper instead of using my hacky function
 // - Figure out the right way to handle the view regions to make the echo bar and chin filebar not mess stuff up.
 // - Think about the performance (or lack thereof) of selection drawing. Shit slows to a crawl.
 // - Rewrite the isearch functions a bit to make more sense, and make them echo alerts if a pattern is not found.
+// - Fix isearch word under cursor to no longer randomly break / not highlight
 // - Replace mode?
 // - Word motion got caught on the following:
 /*
@@ -158,7 +158,6 @@
 // - Cut down on difficult to understand interactions of code, such as vim_enter_visual_insert_mode setting your cursor, 
 //   the numerous odd behaviours of vim_delete_change_or_yank, and more.
 // - Why does vim_previous_buffer not work. Does the command get called?
-// - Why are operators that use gn busted on repeats?
 
 //
 // Internal Defines
