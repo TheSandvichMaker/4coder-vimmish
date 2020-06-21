@@ -167,7 +167,7 @@
 #define VIM_USE_EXPERIMENTAL_AUTO_INDENT 0
 #define VIM_INSERT_NODE_BUFFER_SIZE KB(4)
 #define VIM_WRITABLE_BUFFER_SIZE KB(2)
-#define VIM_PRINT_COMMANDS 1
+#define VIM_PRINT_COMMANDS 0
 
 #define VIM_DEFAULT_BINDING_MAP_SLOT_COUNT 32
 #define VIM_DEFAULT_NESTED_BINDING_MAP_SLOT_COUNT 8
@@ -1333,15 +1333,15 @@ inline b32 vim_keys_are_equal(Vim_Key a, Vim_Key b) {
 // @Cleanup: Rearrage to make the forward declare unnecessary. Maybe.
 internal VIM_TEXT_OBJECT(vim_text_object_line);
 
-// @TODO: Is this how we want to do this?
-Vim_Key_Binding vim_text_object_line_bind = {
-    VimBindingKind_TextObject,
-    string_u8_litexpr("vim_text_object_line (from key repeat)"),
-    0,
-    vim_text_object_line
-};
-
 internal Vim_Key_Binding* vim_query_binding(Application_Links* app, Vim_Binding_Map* map, b32 line_object_on_repeat_input) {
+    // @TODO: Is this how we want to do this?
+    static Vim_Key_Binding vim_text_object_line_bind = {
+        VimBindingKind_TextObject,
+        string_u8_litexpr("vim_text_object_line (from key repeat)"),
+        0,
+        vim_text_object_line
+    };
+
     Vim_Key_Sequence prev_seq = vim_state.current_key_sequence; // @Speed: Copies a 68 byte struct. If that matters, at all.
     Vim_Key key = vim_get_current_key(app);
     Vim_Key previous_final_key = prev_seq.keys[prev_seq.count - 1];
@@ -1958,6 +1958,7 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             vim_state.insert_history_index = buffer_history_get_current_state_index(app, buffer);
             vim_state.insert_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
             vim_state.character_seek_show_highlight = false;
+            print_message(app, push_u8_stringf(&vim_state.arena, "Insert Cursor: line: %lld, col: %lld\n", vim_state.insert_cursor.line, vim_state.insert_cursor.col));
         } break;
 
         case VimMode_Visual:
@@ -2820,7 +2821,7 @@ internal VIM_MOTION(vim_motion_repeat_character_seek_same_direction) {
 }
 
 internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction) {
-    // TODO: Fix this'n
+    // TODO: Fix this'n to be less janky
     Scan_Direction original_dir = vim_state.most_recent_character_seek_dir;
     Scan_Direction dir = -original_dir;
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
@@ -2884,7 +2885,7 @@ internal VIM_MOTION(vim_motion_prior_to_empty_line_down) {
     return result;
 }
 
-internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Scan_Direction direction, i64 pos, String_Const_u8 query, u32 flags, b32 recursed = false) {
+internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view, Buffer_ID buffer, Scan_Direction direction, i64 pos, String_Const_u8 query, u32 flags, b32 wrapped = false) {
     Range_i64 result = Ii64();
 
     b32 found_match = false;
@@ -2925,7 +2926,7 @@ internal Range_i64 vim_search_once_internal(Application_Links* app, View_ID view
         }
     }
 
-    if (!recursed && !found_match) {
+    if (!wrapped && !found_match) {
         switch (direction) {
             case Scan_Forward:  { result = vim_search_once_internal(app, view, buffer, direction, 0, query, flags, true); } break;
             case Scan_Backward: { result = vim_search_once_internal(app, view, buffer, direction, buffer_size, query, flags, true); } break;
@@ -3515,8 +3516,10 @@ CUSTOM_COMMAND_SIG(vim_move_line_up) {
 internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_forward) {
     Vim_Text_Object_Result result = vim_text_object(start_pos);
 
+    i64 pos = view_get_cursor_pos(app, view);
+
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
-    result.range = vim_search_once_internal(app, view, buffer, vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
+    result.range = vim_search_once_internal(app, view, buffer, vim_state.search_direction, pos, last_search, vim_state.search_flags);
     
     vim_state.search_show_highlight = true;
 
@@ -3526,8 +3529,10 @@ internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_forward) {
 internal VIM_TEXT_OBJECT(vim_text_object_isearch_repeat_backward) {
     Vim_Text_Object_Result result = vim_text_object(start_pos);
 
+    i64 pos = view_get_cursor_pos(app, view);
+
     String_Const_u8 last_search = vim_read_register(app, &vim_state.last_search_register);
-    result.range = vim_search_once_internal(app, view, buffer, -vim_state.search_direction, view_get_cursor_pos(app, view), last_search, vim_state.search_flags);
+    result.range = vim_search_once_internal(app, view, buffer, -vim_state.search_direction, pos, last_search, vim_state.search_flags);
     
     vim_state.search_show_highlight = true;
     
@@ -3812,6 +3817,11 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
                     (total_line_range.min != total_line_range.max))
                 {
                     vim_new_line_above(app);
+                }
+            } else {
+                // TODO: Unmessify, this is here because you need to set the cursor before going into insert mode to get behaviour
+                if (mode != VimDCY_Yank) {
+                    view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
                 }
             }
             vim_enter_insert_mode(app);
@@ -4399,7 +4409,9 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
     if (is_vim_insert_mode(vim_state.mode)) {
         Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
         i64 end_pos = cursor.pos;
+        Scratch_Block scratch(app);
         for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
+            print_message(app, push_u8_stringf(scratch, "line: %lld, col: %lld, fwd: %.*s, bck: %.*s\n", node->rel_line, node->rel_col, string_expand(node->text_forward), string_expand(node->text_backward)));
             i64 col = cursor.col + node->rel_col;
             Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(cursor.line, col));
             Range_i64 replace_range = Ii64_size(insert_cursor.pos, node->text_backward.size);
@@ -5989,7 +6001,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_motion_find_character_case_sensitive,               vim_key(KeyCode_F));
     VimBind(vim_motion_find_character_backward_case_sensitive,      vim_key(KeyCode_F, KeyCode_Shift));
     VimBind(vim_motion_to_character_case_sensitive,                 vim_key(KeyCode_T));
-    VimBind(vim_motion_to_character_backward_case_sensitive,       vim_key(KeyCode_T, KeyCode_Shift));
+    VimBind(vim_motion_to_character_backward_case_sensitive,        vim_key(KeyCode_T, KeyCode_Shift));
     VimBind(vim_motion_find_character_pair_case_sensitive,          vim_key(KeyCode_S));
     VimBind(vim_motion_find_character_pair_backward_case_sensitive, vim_key(KeyCode_S, KeyCode_Shift));
     VimBind(vim_motion_repeat_character_seek_same_direction,        vim_key(KeyCode_Semicolon));
