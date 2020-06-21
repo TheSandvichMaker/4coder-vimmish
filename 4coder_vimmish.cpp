@@ -1958,7 +1958,6 @@ internal void vim_enter_mode(Application_Links* app, Vim_Mode mode, b32 append =
             vim_state.insert_history_index = buffer_history_get_current_state_index(app, buffer);
             vim_state.insert_cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
             vim_state.character_seek_show_highlight = false;
-            print_message(app, push_u8_stringf(&vim_state.arena, "Insert Cursor: line: %lld, col: %lld\n", vim_state.insert_cursor.line, vim_state.insert_cursor.col));
         } break;
 
         case VimMode_Visual:
@@ -4411,7 +4410,6 @@ CUSTOM_COMMAND_SIG(vim_repeat_command) {
         i64 end_pos = cursor.pos;
         Scratch_Block scratch(app);
         for (Vim_Insert_Node* node = vim_state.first_insert_node; node; node = node->next) {
-            print_message(app, push_u8_stringf(scratch, "line: %lld, col: %lld, fwd: %.*s, bck: %.*s\n", node->rel_line, node->rel_col, string_expand(node->text_forward), string_expand(node->text_backward)));
             i64 col = cursor.col + node->rel_col;
             Buffer_Cursor insert_cursor = buffer_compute_cursor(app, buffer, seek_line_col(cursor.line, col));
             Range_i64 replace_range = Ii64_size(insert_cursor.pos, node->text_backward.size);
