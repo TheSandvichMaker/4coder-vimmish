@@ -78,10 +78,6 @@
 #define VIM_AUTO_LINE_COMMENTS 1
 #endif
 
-#ifndef VIM_CASE_SENSITIVE_CHARACTER_SEEK
-#define VIM_CASE_SENSITIVE_CHARACTER_SEEK 1
-#endif
-
 #ifndef VIM_AUTO_INDENT_ON_PASTE
 #define VIM_AUTO_INDENT_ON_PASTE 1            // @TODO: Maybe just make this a separate command
 #endif
@@ -766,8 +762,7 @@ struct Vim_Global_State {
     u8                   most_recent_character_seek_storage[8];
     String_u8            most_recent_character_seek;
     Scan_Direction       most_recent_character_seek_dir;
-    b32                  most_recent_character_seek_till;
-    b32                  most_recent_character_seek_inclusive;
+    u32                  most_recent_character_seek_flags;
 
     b32                  capture_queries_into_chord_bar;
     u8                   chord_bar_storage[64];
@@ -2659,11 +2654,18 @@ internal VIM_TEXT_OBJECT(vim_text_object_inner_word) {
     return result;
 }
 
-internal Vim_Motion_Result vim_motion_character_seek_internal(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, String_Const_u8 target, Scan_Direction dir, b32 till) {
-    Vim_Motion_Result result = vim_motion(start_pos);
-    b32 inclusive = (dir == Scan_Forward);
-    result.style  = inclusive ? VimRangeStyle_Inclusive : VimRangeStyle_Exclusive;
-    result.flags |= VimMotionFlag_SetPreferredX;
+enum Vim_Character_Seek_Flag {
+    VimCharacterSeek_Pair = 0x1,
+    VimCharacterSeek_Till = 0x2,
+    VimCharacterSeek_CaseSensitive = 0x4,
+    VimCharacterSeek_Repeat = 0x8,
+};
+
+internal i64 vim_character_seek(Application_Links* app, View_ID view, Buffer_ID buffer, i64 start_pos, String_Const_u8 target, Scan_Direction dir, u32 flags) {
+    i64 result = start_pos;
+
+    b32 till = HasFlag(flags, VimCharacterSeek_Till);
+    b32 case_sensitive = HasFlag(flags, VimCharacterSeek_CaseSensitive);
 
     b32 new_input = true;
     if (!target.size) {
@@ -2678,21 +2680,18 @@ internal Vim_Motion_Result vim_motion_character_seek_internal(Application_Links*
             if (match.buffer != buffer) {
                 break;
             }
-            // @TODO: Make this work as a separate command instead
-#if VIM_CASE_SENSITIVE_CHARACTER_SEEK
-            if (HasFlag(match.flags, StringMatch_CaseSensitive))
-#endif
-            {
+            if (!case_sensitive || HasFlag(match.flags, StringMatch_CaseSensitive)) {
                 if (dir == Scan_Forward) {
-                    result.seek_pos = match.range.min + (till ? -1 : 0);
+                    result = match.range.min + (till ? -1 : 0);
                 } else {
-                    result.seek_pos = match.range.max - 1 + (till ? target.size : 0);
+                    result = match.range.max - 1 + (till ? target.size : 0);
                 }
                 break;
             }
-#if VIM_CASE_SENSITIVE_CHARACTER_SEEK
-            seek_pos = match.range.min;
-#endif
+            if (case_sensitive) {
+                // TODO: Wait, what the hell does this do? Why would case sensitivity influence seek_pos?
+                seek_pos = match.range.min;
+            }
         }
 
         if (new_input) {
@@ -2704,8 +2703,7 @@ internal Vim_Motion_Result vim_motion_character_seek_internal(Application_Links*
 
             vim_state.character_seek_highlight_dir = dir;
             vim_state.most_recent_character_seek_dir = dir;
-            vim_state.most_recent_character_seek_till = till;
-            vim_state.most_recent_character_seek_inclusive = inclusive;
+            vim_state.most_recent_character_seek_flags = flags;
         }
     }
 
@@ -2715,90 +2713,121 @@ internal Vim_Motion_Result vim_motion_character_seek_internal(Application_Links*
 internal VIM_MOTION(vim_motion_repeat_character_seek_same_direction);
 internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction);
 
-internal VIM_MOTION(vim_motion_find_character) {
-    String_Const_u8 target = vim_get_next_writable(app);
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Forward, false);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
+internal Vim_Motion_Result vim_motion_character_seek_internal(
+    Application_Links* app,
+    View_ID view,
+    Buffer_ID buffer,
+    i32 motion_count,
+    i64 start_pos,
+    Scan_Direction dir,
+    u32 flags
+) {
+    Vim_Motion_Result result = vim_motion(start_pos);
+    result.style  = (dir == Scan_Forward) ? VimRangeStyle_Inclusive : VimRangeStyle_Exclusive;
+    result.flags |= VimMotionFlag_SetPreferredX|
+                    VimMotionFlag_IsJump|
+                    VimMotionFlag_LogJumpPostSeek|
+                    VimMotionFlag_IgnoreMotionCount;
+
+    u8 target_storage[8];
+    String_u8 target = Su8(target_storage, 0, ArrayCount(target_storage));
+
+    if (HasFlag(flags, VimCharacterSeek_Repeat)) {
+        target = vim_state.most_recent_character_seek;
+    } else {
+        string_append(&target, vim_get_next_writable(app));
+        if (HasFlag(flags, VimCharacterSeek_Pair)) {
+            string_append(&target, vim_get_next_writable(app));
+        }
     }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+
+    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
+
+    result.seek_pos = vim_character_seek(app, view, buffer, start_pos, target.string, dir, flags);
+    for (i32 i = 1; i < motion_count; ++i) {
+        result = vim_motion_repeat_character_seek_same_direction(app, view, buffer, result.seek_pos, 1, false);
+    }
+
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_find_character) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, 0);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_to_character) {
-    String_Const_u8 target = vim_get_next_writable(app);
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Forward, true);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
-    }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, VimCharacterSeek_Till);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_find_character_backward) {
-    String_Const_u8 target = vim_get_next_writable(app);
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Backward, false);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
-    }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, 0);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_to_character_backward) {
-    String_Const_u8 target = vim_get_next_writable(app);
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target, Scan_Backward, true);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
-    }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, VimCharacterSeek_Till);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_find_character_pair) {
-    u8 target_storage[8];
-    String_u8 target = Su8(target_storage, 0, ArrayCount(target_storage));
-    string_append(&target, vim_get_next_writable(app));
-    string_append(&target, vim_get_next_writable(app));
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target.string, Scan_Forward, false);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
-    }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, VimCharacterSeek_Pair);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_find_character_pair_backward) {
-    u8 target_storage[8];
-    String_u8 target = Su8(target_storage, 0, ArrayCount(target_storage));
-    string_append(&target, vim_get_next_writable(app));
-    string_append(&target, vim_get_next_writable(app));
-    vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
-    Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view, buffer, start_pos, target.string, Scan_Backward, false);
-    for (i32 i = 1; i < motion_count; ++i) {
-        mr = vim_motion_repeat_character_seek_same_direction(app, view, buffer, mr.seek_pos, 1, false);
-    }
-    mr.flags |= VimMotionFlag_IsJump|VimMotionFlag_LogJumpPostSeek|VimMotionFlag_IgnoreMotionCount;
-    return mr;
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, VimCharacterSeek_Pair);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_find_character_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, VimCharacterSeek_CaseSensitive);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_to_character_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, VimCharacterSeek_Till|VimCharacterSeek_CaseSensitive);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_find_character_backward_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, VimCharacterSeek_CaseSensitive);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_to_character_backward_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, VimCharacterSeek_Till|VimCharacterSeek_CaseSensitive);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_find_character_pair_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Forward, VimCharacterSeek_Pair|VimCharacterSeek_CaseSensitive);
+    return result;
+}
+
+internal VIM_MOTION(vim_motion_find_character_pair_backward_case_sensitive) {
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, Scan_Backward, VimCharacterSeek_Pair|VimCharacterSeek_CaseSensitive);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_repeat_character_seek_same_direction) {
     Scan_Direction dir = vim_state.most_recent_character_seek_dir;
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     vim_state.character_seek_highlight_dir = dir;
-    return vim_motion_character_seek_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_till);
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, dir, vim_state.most_recent_character_seek_flags|VimCharacterSeek_Repeat);
+    return result;
 }
 
 internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction) {
-    Scan_Direction dir = -vim_state.most_recent_character_seek_dir;
+    // TODO: Fix this'n
+    Scan_Direction original_dir = vim_state.most_recent_character_seek_dir;
+    Scan_Direction dir = -original_dir;
     vim_state.character_seek_show_highlight = !vim_state.executing_queried_motion;
     vim_state.character_seek_highlight_dir = dir;
-    return vim_motion_character_seek_internal(app, view, buffer, start_pos, SCu8(), dir, vim_state.most_recent_character_seek_till);
+    Vim_Motion_Result result = vim_motion_character_seek_internal(app, view, buffer, motion_count, start_pos, dir, vim_state.most_recent_character_seek_flags|VimCharacterSeek_Repeat);
+    vim_state.most_recent_character_seek_dir = original_dir;
+    return result;
 }
 
 internal i64 vim_seek_blank_line(Application_Links *app, Scan_Direction direction, Position_Within_Line position) {
@@ -5095,11 +5124,11 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
         // NOTE: Vim Character Seek highlight
         i64 pos = view_get_cursor_pos(app, view_id);
         while (range_contains(visible_range, pos)) {
-            Vim_Motion_Result mr = vim_motion_character_seek_internal(app, view_id, buffer, pos, SCu8(), vim_state.character_seek_highlight_dir, vim_state.most_recent_character_seek_till);
-            if (mr.seek_pos == pos) {
+            i64 seek_pos = vim_character_seek(app, view_id, buffer, pos, SCu8(), vim_state.character_seek_highlight_dir, vim_state.most_recent_character_seek_flags);
+            if (seek_pos == pos) {
                 break;
             }
-            Range_i64 range = Ii64_size(mr.seek_pos, vim_state.most_recent_character_seek.size);
+            Range_i64 range = Ii64_size(seek_pos, vim_state.most_recent_character_seek.size);
 #if VIM_USE_CUSTOM_COLORS
             FColor highlight_color = fcolor_id(defcolor_vim_character_highlight);
 #else
@@ -5107,7 +5136,7 @@ function void vim_render_buffer(Application_Links *app, View_ID view_id, Face_ID
 #endif
             vim_draw_character_block_selection(app, buffer, text_layout_id, range, cursor_roundness, highlight_color);
             paint_text_color_fcolor(app, text_layout_id, range, fcolor_id(defcolor_at_highlight));
-            pos = mr.seek_pos;
+            pos = seek_pos;
         }
     }
 #endif
@@ -5934,37 +5963,37 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimSelectMap(vim_map_operator_pending);
     VimAddParentMap(vim_map_text_objects);
 
-    VimBind(vim_motion_left,                                     vim_key(KeyCode_H));
-    VimBind(vim_motion_down,                                     vim_key(KeyCode_J));
-    VimBind(vim_motion_up,                                       vim_key(KeyCode_K));
-    VimBind(vim_motion_right,                                    vim_key(KeyCode_L));
-    VimBind(vim_motion_left,                                     vim_key(KeyCode_Left));
-    VimBind(vim_motion_down,                                     vim_key(KeyCode_Down));
-    VimBind(vim_motion_up,                                       vim_key(KeyCode_Up));
-    VimBind(vim_motion_right,                                    vim_key(KeyCode_Right));
-    VimBind(vim_motion_to_empty_line_down,                       vim_key(KeyCode_RightBracket, KeyCode_Shift));
-    VimBind(vim_motion_to_empty_line_up,                         vim_key(KeyCode_LeftBracket, KeyCode_Shift));
-    VimBind(vim_motion_word,                                     vim_key(KeyCode_W));
-    VimBind(vim_motion_big_word,                                 vim_key(KeyCode_W, KeyCode_Shift));
-    VimBind(vim_motion_word_end,                                 vim_key(KeyCode_E));
-    VimBind(vim_motion_word_backward,                            vim_key(KeyCode_B));
-    VimBind(vim_motion_big_word_backward,                        vim_key(KeyCode_B, KeyCode_Shift));
-    VimBind(vim_motion_line_start_textual,                       vim_key(KeyCode_0));
-    VimBind(vim_motion_line_end_textual,                         vim_key(KeyCode_4, KeyCode_Shift));
-    VimBind(vim_motion_scope,                                    vim_key(KeyCode_5, KeyCode_Shift));
-    VimBind(vim_motion_buffer_start_or_goto_line,                vim_key(KeyCode_G), vim_key(KeyCode_G));
-    VimBind(vim_motion_buffer_end_or_goto_line,                  vim_key(KeyCode_G, KeyCode_Shift));
-    VimBind(vim_motion_page_top,                                 vim_key(KeyCode_H, KeyCode_Shift));
-    VimBind(vim_motion_page_mid,                                 vim_key(KeyCode_M, KeyCode_Shift));
-    VimBind(vim_motion_page_bottom,                              vim_key(KeyCode_L, KeyCode_Shift));
-    VimBind(vim_motion_find_character,                           vim_key(KeyCode_F));
-    VimBind(vim_motion_find_character_backward,                  vim_key(KeyCode_F, KeyCode_Shift));
-    VimBind(vim_motion_to_character,                             vim_key(KeyCode_T));
-    VimBind(vim_motion_to_character_backward,                    vim_key(KeyCode_T, KeyCode_Shift));
-    VimBind(vim_motion_find_character_pair,                      vim_key(KeyCode_S));
-    VimBind(vim_motion_find_character_pair_backward,             vim_key(KeyCode_S, KeyCode_Shift));
-    VimBind(vim_motion_repeat_character_seek_same_direction,     vim_key(KeyCode_Semicolon));
-    VimBind(vim_motion_repeat_character_seek_reverse_direction,  vim_key(KeyCode_Comma));
+    VimBind(vim_motion_left,                                        vim_key(KeyCode_H));
+    VimBind(vim_motion_down,                                        vim_key(KeyCode_J));
+    VimBind(vim_motion_up,                                          vim_key(KeyCode_K));
+    VimBind(vim_motion_right,                                       vim_key(KeyCode_L));
+    VimBind(vim_motion_left,                                        vim_key(KeyCode_Left));
+    VimBind(vim_motion_down,                                        vim_key(KeyCode_Down));
+    VimBind(vim_motion_up,                                          vim_key(KeyCode_Up));
+    VimBind(vim_motion_right,                                       vim_key(KeyCode_Right));
+    VimBind(vim_motion_to_empty_line_down,                          vim_key(KeyCode_RightBracket, KeyCode_Shift));
+    VimBind(vim_motion_to_empty_line_up,                            vim_key(KeyCode_LeftBracket,  KeyCode_Shift));
+    VimBind(vim_motion_word,                                        vim_key(KeyCode_W));
+    VimBind(vim_motion_big_word,                                    vim_key(KeyCode_W, KeyCode_Shift));
+    VimBind(vim_motion_word_end,                                    vim_key(KeyCode_E));
+    VimBind(vim_motion_word_backward,                               vim_key(KeyCode_B));
+    VimBind(vim_motion_big_word_backward,                           vim_key(KeyCode_B, KeyCode_Shift));
+    VimBind(vim_motion_line_start_textual,                          vim_key(KeyCode_0));
+    VimBind(vim_motion_line_end_textual,                            vim_key(KeyCode_4, KeyCode_Shift));
+    VimBind(vim_motion_scope,                                       vim_key(KeyCode_5, KeyCode_Shift));
+    VimBind(vim_motion_buffer_start_or_goto_line,                   vim_key(KeyCode_G),           vim_key(KeyCode_G));
+    VimBind(vim_motion_buffer_end_or_goto_line,                     vim_key(KeyCode_G, KeyCode_Shift));
+    VimBind(vim_motion_page_top,                                    vim_key(KeyCode_H, KeyCode_Shift));
+    VimBind(vim_motion_page_mid,                                    vim_key(KeyCode_M, KeyCode_Shift));
+    VimBind(vim_motion_page_bottom,                                 vim_key(KeyCode_L, KeyCode_Shift));
+    VimBind(vim_motion_find_character_case_sensitive,               vim_key(KeyCode_F));
+    VimBind(vim_motion_find_character_backward_case_sensitive,      vim_key(KeyCode_F, KeyCode_Shift));
+    VimBind(vim_motion_to_character_case_sensitive,                 vim_key(KeyCode_T));
+    VimBind(vim_motion_to_character_backward_case_sensitive,       vim_key(KeyCode_T, KeyCode_Shift));
+    VimBind(vim_motion_find_character_pair_case_sensitive,          vim_key(KeyCode_S));
+    VimBind(vim_motion_find_character_pair_backward_case_sensitive, vim_key(KeyCode_S, KeyCode_Shift));
+    VimBind(vim_motion_repeat_character_seek_same_direction,        vim_key(KeyCode_Semicolon));
+    VimBind(vim_motion_repeat_character_seek_reverse_direction,     vim_key(KeyCode_Comma));
 
     //
     // Normal Vim Map
