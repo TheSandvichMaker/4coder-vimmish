@@ -3757,6 +3757,7 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
     Scratch_Block scratch(app);
     List_String_Const_u8 yank_string_list = {};
 
+    i64 cursor_start_pos = view_get_cursor_pos(app, view);
     Range_i64 total_line_range = Ii64_neg_inf;
     if (motion) state->motion = motion;
     while (vim_get_operator_range(state, &range, op_flags)) {
@@ -3768,7 +3769,7 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
         }
 
         i64 line = line_range.min;
-        if (prev_line && prev_line != line) {
+        if (prev_line && prev_line != line && mode != VimDCY_Yank) {
             insert_final_newline = true;
             string_list_push(scratch, &yank_string_list, eol);
         }
@@ -3777,14 +3778,16 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
 
         if (mode == VimDCY_Delete || mode == VimDCY_Change) {
             yank_string = vim_cut_range(app, scratch, view, buffer, range);
-        } else {
+        } else /* mode == VimDCY_Yank */ {
             yank_string = push_buffer_range(app, scratch, buffer, range);
+            vim_rel_move(app, seek_line_col(1, 0));
         }
 
         string_list_push(scratch, &yank_string_list, yank_string);
 
         prev_line = line;
     }
+
 
     if (insert_final_newline) {
         string_list_push(scratch, &yank_string_list, eol);
@@ -3828,6 +3831,8 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
 
     if (set_cursor && did_act && mode != VimDCY_Yank) {
         view_set_cursor_and_preferred_x(app, view, seek_pos(state->total_range.min));
+    } else if (mode == VimDCY_Yank) {
+        view_set_cursor_and_preferred_x(app, view, seek_pos(cursor_start_pos));
     }
 }
 
@@ -5988,6 +5993,7 @@ function void vim_setup_default_mapping(Application_Links* app, Mapping *mapping
     VimBind(vim_motion_word_backward,                               vim_key(KeyCode_B));
     VimBind(vim_motion_big_word_backward,                           vim_key(KeyCode_B, KeyCode_Shift));
     VimBind(vim_motion_line_start_textual,                          vim_key(KeyCode_0));
+    VimBind(vim_motion_line_start_textual,                          vim_key(KeyCode_6, KeyCode_Shift));
     VimBind(vim_motion_line_end_textual,                            vim_key(KeyCode_4, KeyCode_Shift));
     VimBind(vim_motion_scope,                                       vim_key(KeyCode_5, KeyCode_Shift));
     VimBind(vim_motion_buffer_start_or_goto_line,                   vim_key(KeyCode_G),           vim_key(KeyCode_G));
