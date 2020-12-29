@@ -3278,19 +3278,32 @@ internal void vim_toggle_line_comment_range(Application_Links* app, Buffer_ID bu
     }
 }
 
+function void
+vim_toggle_line_comment_internal(Application_Links* app,
+                                 View_ID view,
+                                 Buffer_ID buffer,
+                                 Vim_Visual_Selection selection,
+                                 i32 count,
+                                 b32 comment_empty_lines,
+                                 Vim_Comment_Style style,
+                                 Vim_Toggle_Comment_Mode mode)
+{
+    i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
+    Range_i64 line_range = Ii64(line, line + count);
+    
+    if (selection.kind) {
+        line_range = Ii64(selection.first_line, selection.one_past_last_line);
+    }
+    
+    vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
+}
+
 internal VIM_OPERATOR(vim_toggle_line_comment_no_indent_style) {
     Vim_Comment_Style style       = VimCommentStyle_NoIndent;
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
     
     b32 comment_empty_lines = false; // @TODO: Expose to user
-    
-    if (selection.kind) {
-        Range_i64 line_range = Ii64(selection.first_line, selection.one_past_last_line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
-    } else {
-        i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
-    }
+    vim_toggle_line_comment_internal(app, view, buffer, selection, count, comment_empty_lines, style, mode);
 }
 
 internal VIM_OPERATOR(vim_toggle_line_comment_range_indent_style) {
@@ -3298,14 +3311,7 @@ internal VIM_OPERATOR(vim_toggle_line_comment_range_indent_style) {
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
     
     b32 comment_empty_lines = false; // @TODO: Expose to user
-    
-    if (selection.kind) {
-        Range_i64 line_range = Ii64(selection.first_line, selection.one_past_last_line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
-    } else {
-        i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
-    }
+    vim_toggle_line_comment_internal(app, view, buffer, selection, count, comment_empty_lines, style, mode);
 }
 
 internal VIM_OPERATOR(vim_toggle_line_comment_full_indent_style) {
@@ -3313,14 +3319,7 @@ internal VIM_OPERATOR(vim_toggle_line_comment_full_indent_style) {
     Vim_Toggle_Comment_Mode mode  = VimToggleComment_Auto;
     
     b32 comment_empty_lines = false; // @TODO: Expose to user
-    
-    if (selection.kind) {
-        Range_i64 line_range = Ii64(selection.first_line, selection.one_past_last_line);
-        vim_toggle_line_comment_range(app, buffer, line_range, vim_cpp_line_comment, comment_empty_lines, style, mode);
-    } else {
-        i64 line = get_line_number_from_pos(app, buffer, view_get_cursor_pos(app, view));
-        vim_toggle_line_comment_range(app, buffer, Ii64(line), vim_cpp_line_comment, comment_empty_lines, style, mode);
-    }
+    vim_toggle_line_comment_internal(app, view, buffer, selection, count, comment_empty_lines, style, mode);
 }
 
 function void vim_write_text(Application_Links *app, String_Const_u8 insert) {
