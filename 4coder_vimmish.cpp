@@ -2629,8 +2629,8 @@ vim_motion_scope_internal(Application_Links* app,
     // NOTE: One minor disappointment regarding this function is that because it uses tokens, it doesn't work inside comments.
     //       That's lame. I want it to work inside comments.
     Vim_Motion_Result result = vim_motion_inclusive(start_pos);
-    result.flags |= VimMotionFlag_IsJump|
-        VimMotionFlag_SetPreferredX;
+    result.flags |= (VimMotionFlag_IsJump|
+                     VimMotionFlag_SetPreferredX);
     
     Token_Array token_array = get_token_array_from_buffer(app, buffer);
     if (token_array.count > 0) {
@@ -2647,11 +2647,10 @@ vim_motion_scope_internal(Application_Links* app,
             }
             
             if (unlimited_lookahead || range_contains_inclusive(line_range, token->pos + token->size)) {
-                if (token->kind == TokenBaseKind_ScopeOpen          ||
-                    token->kind == TokenBaseKind_ParentheticalOpen  ||
-                    token->kind == TokenBaseKind_ScopeOpen          ||
-                    token->kind == TokenBaseKind_ParentheticalClose ||
-                    token->kind == TokenBaseKind_ScopeClose)
+                if (token->kind == TokenBaseKind_ScopeOpen         ||
+                    token->kind == TokenBaseKind_ParentheticalOpen ||
+                    token->kind == TokenBaseKind_ScopeClose        ||
+                    token->kind == TokenBaseKind_ParentheticalClose)
                 {
                     opening_token = token->kind;
                 } else {
