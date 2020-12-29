@@ -336,8 +336,8 @@ enum Vim_Mode {
 };
 
 internal b32 is_vim_insert_mode(Vim_Mode mode) {
-    b32 result = (mode == VimMode_Insert) ||
-        (mode == VimMode_VisualInsert);
+    b32 result = ((mode == VimMode_Insert) ||
+                  (mode == VimMode_VisualInsert));
     return result;
 }
 
@@ -1642,43 +1642,46 @@ CUSTOM_COMMAND_SIG(vim_go_to_mark_less_history) {
 
 internal Vim_Visual_Selection vim_get_selection(Application_Links* app, View_ID view, Buffer_ID buffer) {
     Vim_Visual_Selection selection = {};
-    Buffer_Cursor first = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
-    Buffer_Cursor last  = buffer_compute_cursor(app, buffer, seek_pos(view_get_mark_pos(app, view)));
-    if (first.pos > last.pos) {
-        Swap(Buffer_Cursor, first, last);
-    }
-    selection.first_line         = first.line;
-    selection.first_col          = first.col;
-    selection.one_past_last_line = last.line;
-    selection.one_past_last_col  = last.col;
-    
-    switch (vim_state.mode) {
-        case VimMode_Visual: {
-            selection.kind = VimSelectionKind_Range;
-        } break;
+
+    if (is_vim_visual_mode(vim_state.mode)) {
+        Buffer_Cursor first = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
+        Buffer_Cursor last  = buffer_compute_cursor(app, buffer, seek_pos(view_get_mark_pos(app, view)));
+        if (first.pos > last.pos) {
+            Swap(Buffer_Cursor, first, last);
+        }
+        selection.first_line         = first.line;
+        selection.first_col          = first.col;
+        selection.one_past_last_line = last.line;
+        selection.one_past_last_col  = last.col;
         
-        case VimMode_VisualLine: {
-            selection.kind = VimSelectionKind_Line;
-            selection.first_col         = 1;
-            selection.one_past_last_col = max_i32;
-        } break;
-        
-        case VimMode_VisualBlock: {
-            selection.kind = VimSelectionKind_Block;
-            if (selection.first_line > selection.one_past_last_line) {
-                Swap(i64, selection.first_line, selection.one_past_last_line);
-            }
-            if (selection.first_col > selection.one_past_last_col) {
-                Swap(i64, selection.first_col, selection.one_past_last_col);
-            }
-            if (vim_state.visual_block_force_to_line_end) {
+        switch (vim_state.mode) {
+            case VimMode_Visual: {
+                selection.kind = VimSelectionKind_Range;
+            } break;
+            
+            case VimMode_VisualLine: {
+                selection.kind = VimSelectionKind_Line;
+                selection.first_col         = 1;
                 selection.one_past_last_col = max_i32;
-            }
-        } break;
+            } break;
+            
+            case VimMode_VisualBlock: {
+                selection.kind = VimSelectionKind_Block;
+                if (selection.first_line > selection.one_past_last_line) {
+                    Swap(i64, selection.first_line, selection.one_past_last_line);
+                }
+                if (selection.first_col > selection.one_past_last_col) {
+                    Swap(i64, selection.first_col, selection.one_past_last_col);
+                }
+                if (vim_state.visual_block_force_to_line_end) {
+                    selection.one_past_last_col = max_i32;
+                }
+            } break;
+        }
+        
+        selection.one_past_last_line++;
+        selection.one_past_last_col++;
     }
-    
-    selection.one_past_last_line++;
-    selection.one_past_last_col++;
     
     return selection;
 }
@@ -3821,14 +3824,20 @@ internal void vim_delete_change_or_yank(Application_Links* app, Vim_Operator_Sta
         prev_line = line;
     }
     
-    
     if (insert_final_newline) {
         string_list_push(scratch, &yank_string_list, eol);
     }
-    
-    String_Const_u8 yank_string = string_list_flatten(scratch, yank_string_list, StringFill_NoTerminate);
+
+    b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
+
+    String_Const_u8 yank_string;
+    if (from_block_copy) {
+        yank_string = string_list_flatten(scratch, yank_string_list, eol, StringSeparator_AfterLast, StringFill_NoTerminate);
+    } else {
+        yank_string = string_list_flatten(scratch, yank_string_list, StringFill_NoTerminate);
+    }
+
     if (yank_string.size) {
-        b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
         vim_write_register(app, vim_state.active_register, yank_string, from_block_copy);
     }
     
@@ -3928,8 +3937,6 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
         b32 do_block_paste = HasFlag(vim_state.active_register->flags, VimRegisterFlag_FromBlockCopy) || (selection.kind == VimSelectionKind_Block);
         
         if (do_block_paste) {
-            Range_i64 replace_range = {};
-            
             // @TODO: This shouldn't really try to guess, instead it should just split on both \r\n and \n
             Line_Ending_Kind eol_kind = string_guess_line_ending_kind(paste_string);
             String_Const_u8 newline_needle = SCu8("\n");
@@ -3937,8 +3944,6 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
                 case LineEndingKind_CRLF: { newline_needle = string_u8_litexpr("\r\n"); } break;
                 case LineEndingKind_LF:   { newline_needle = string_u8_litexpr("\n"); } break;
             }
-            
-            i64 visual_block_line_count = (selection.one_past_last_line - selection.first_line);
             
             List_String_Const_u8 paste_lines = string_split_needle(scratch, paste_string, newline_needle);
             List_String_Const_u8 replaced_string_list = {};
@@ -3954,16 +3959,20 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
             
             if (selection.kind == VimSelectionKind_None) {
                 Buffer_Cursor cursor = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
-                selection.kind                     = VimSelectionKind_Block;
+                selection.kind               = VimSelectionKind_Block;
                 selection.first_line         = cursor.line;
                 selection.one_past_last_line = cursor.line + Max(1, newline_count);
                 selection.first_col          = selection.one_past_last_col = cursor.col + (post_cursor ? 1 : 0);
             }
             
+            i64 visual_block_line_count = (selection.one_past_last_line - selection.first_line);
+            
             i64 post_paste_pos = buffer_compute_cursor(app, buffer, seek_line_col(selection.first_line, selection.first_col)).pos;
             b32 replaces_something = selection.first_col != selection.one_past_last_col;
             
             Node_String_Const_u8* line = paste_lines.first;
+
+            Range_i64 replace_range = {};
             while (vim_selection_consume_line(app, buffer, &selection, &replace_range, true)) {
                 if (replaces_something) {
                     String_Const_u8 replaced_string = push_buffer_range(app, scratch, buffer, replace_range);
@@ -3976,8 +3985,16 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
                 while (line && string_match(line->string, newline_needle)) {
                     line = line->next;
                 }
+
+                i64 line_number = get_line_number_from_pos(app, buffer, replace_range.first);
+                Buffer_Cursor line_end_cursor = buffer_compute_cursor(app, buffer, seek_line_col(line_number, -1));
+
+                i32 pad_front = 0;
+                if (selection.first_col > line_end_cursor.col) {
+                    pad_front = (i32)(selection.first_col - line_end_cursor.col) + 1;
+                }
                 
-                Range_i64 tail_range = Ii64(replace_range.min, get_line_end_pos_from_pos(app, buffer, replace_range.max));
+                Range_i64 tail_range = Ii64(replace_range.min, line_end_cursor.pos);
                 String_Const_u8 tail = push_buffer_range(app, scratch, buffer, tail_range);
                 
                 b32 tail_contains_non_whitespace_characters = false;
@@ -3995,10 +4012,10 @@ internal void vim_paste_internal(Application_Links* app, b32 post_cursor) {
                     line_string = line->string;
                     line = line->next;
                     
-                    if (tail_contains_non_whitespace_characters) {
+                    if (pad_front || tail_contains_non_whitespace_characters) {
                         Assert(line_string.size <= longest_line_size);
-                        i32 pad_spaces = cast(i32) (longest_line_size - line_string.size);
-                        line_string = push_u8_stringf(scratch, "%.*s%*s", string_expand(line_string), pad_spaces, "");
+                        i32 pad_back = (i32)(longest_line_size - line_string.size);
+                        line_string = push_u8_stringf(scratch, "%*s%.*s%*s", pad_front, "", string_expand(line_string), pad_back, "");
                     }
                 } else {
                     if (tail_contains_non_whitespace_characters) {
