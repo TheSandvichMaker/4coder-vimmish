@@ -234,7 +234,11 @@ enum Vim_DynString_Mode {
 };
 
 function void
-vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source, Vim_DynString_Mode mode = VimDynString_Compact) {
+vim_string_copy_dynamic(Base_Allocator* alloc, 
+                        String_u8* dest, 
+                        String_Const_u8 source, 
+                        Vim_DynString_Mode mode = VimDynString_Compact) 
+{
     u64 new_cap = 0;
     
     if (dest->cap < source.size) {
@@ -266,7 +270,11 @@ vim_string_copy_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 
 }
 
 function String_Const_u8
-vim_string_append_dynamic(Base_Allocator* alloc, String_u8* dest, String_Const_u8 source, Vim_DynString_Mode mode = VimDynString_Compact) {
+vim_string_append_dynamic(Base_Allocator* alloc, 
+                          String_u8* dest, 
+                          String_Const_u8 source, 
+                          Vim_DynString_Mode mode = VimDynString_Compact) 
+{
     u64 result_size = dest->size + source.size;
     
     u64 new_cap = 0;
@@ -315,7 +323,7 @@ vim_string_free(Base_Allocator* alloc, String_u8* string) {
     block_zero_struct(string);
 }
 
- function String_Const_u8
+function String_Const_u8
 vim_push_string_buffer(u32 buffer_size, u32* buffer_used, u8* buffer, String_Const_u8 str) {
     String_Const_u8 result = SCu8();
     Assert(*buffer_used <= buffer_size);
@@ -339,14 +347,14 @@ enum Vim_Mode {
     VimMode_VisualBlock,
 };
 
- function b32
+function b32
 is_vim_insert_mode(Vim_Mode mode) {
     b32 result = ((mode == VimMode_Insert) ||
                   (mode == VimMode_VisualInsert));
     return result;
 }
 
- function b32 is_vim_visual_mode(Vim_Mode mode) {
+function b32 is_vim_visual_mode(Vim_Mode mode) {
     b32 result = ((mode == VimMode_Visual)     ||
                   (mode == VimMode_VisualLine) ||
                   (mode == VimMode_VisualBlock));
@@ -652,14 +660,14 @@ input_modifier_set_fixed_to_vim_modifiers(Input_Modifier_Set_Fixed mods) {
 
 function Vim_Key
 vim_key(Key_Code kc,
-                         Key_Code mod1 = 0,
-                         Key_Code mod2 = 0,
-                         Key_Code mod3 = 0,
-                         Key_Code mod4 = 0,
-                         Key_Code mod5 = 0,
-                         Key_Code mod6 = 0,
-                         Key_Code mod7 = 0,
-                         Key_Code mod8 = 0)
+        Key_Code mod1 = 0,
+        Key_Code mod2 = 0,
+        Key_Code mod3 = 0,
+        Key_Code mod4 = 0,
+        Key_Code mod5 = 0,
+        Key_Code mod6 = 0,
+        Key_Code mod7 = 0,
+        Key_Code mod8 = 0)
 {
     Input_Modifier_Set_Fixed mods = {};
     if (mod1) mods.mods[mods.count++] = mod1;
@@ -680,13 +688,13 @@ vim_key(Key_Code kc,
 
 function Vim_Key_Sequence
 vim_key_sequence(Vim_Key key1,
-                                           Vim_Key key2 = {},
-                                           Vim_Key key3 = {},
-                                           Vim_Key key4 = {},
-                                           Vim_Key key5 = {},
-                                           Vim_Key key6 = {},
-                                           Vim_Key key7 = {},
-                                           Vim_Key key8 = {})
+                 Vim_Key key2 = {},
+                 Vim_Key key3 = {},
+                 Vim_Key key4 = {},
+                 Vim_Key key5 = {},
+                 Vim_Key key6 = {},
+                 Vim_Key key7 = {},
+                 Vim_Key key8 = {})
 {
     Vim_Key_Sequence result = {};
     result.keys[result.count++] = key1;
@@ -1227,7 +1235,7 @@ vim_get_next_input(Application_Links *app, Event_Property use_flags, Event_Prope
 function String_Const_u8
 vim_get_next_writable(Application_Links* app) {
     String_Const_u8 result = SCu8();
-
+    
     if (vim_state.playing_back_command) {
         Assert(vim_state.current_queued_writable);
         result = vim_state.current_queued_writable->writable;
@@ -1246,16 +1254,16 @@ vim_get_next_writable(Application_Links* app) {
         }
         vim_state.process_text_input_from_dead_key = false;
     }
-
+    
     return result;
 }
 
 function b32
 vim_keystroke_is_dead_key(User_Input in) {
     b32 result = false;
-
+    
     // NOTE: Ideally, we'd have an API for this.
-
+    
     Input_Event* event = &in.event;
 #if VIM_KEYBOARD_LAYOUT == VIM_KEYBOARD_LAYOUT_US_INTERNATIONAL
     if (match_key_code(event, KeyCode_Quote) ||
@@ -1264,7 +1272,7 @@ vim_keystroke_is_dead_key(User_Input in) {
         result = true;
     }
 #endif
-
+    
     return result;
 }
 
@@ -1300,7 +1308,7 @@ vim_get_key_from_input_query(Application_Links* app, Vim_Query_Mode mode) {
         
         result.kc = in.event.key.code;
         result.mods = input_modifier_set_to_vim_modifiers(in.event.key.modifiers);
-
+        
         if (vim_keystroke_is_dead_key(in)) {
             vim_state.process_text_input_from_dead_key = true;
         }
@@ -1706,7 +1714,7 @@ CUSTOM_COMMAND_SIG(vim_go_to_mark_less_history) {
 function Vim_Visual_Selection
 vim_get_selection(Application_Links* app, View_ID view, Buffer_ID buffer) {
     Vim_Visual_Selection selection = {};
-
+    
     if (is_vim_visual_mode(vim_state.mode)) {
         Buffer_Cursor first = buffer_compute_cursor(app, buffer, seek_pos(view_get_cursor_pos(app, view)));
         Buffer_Cursor last  = buffer_compute_cursor(app, buffer, seek_pos(view_get_mark_pos(app, view)));
@@ -2926,12 +2934,12 @@ internal VIM_MOTION(vim_motion_repeat_character_seek_reverse_direction);
 
 function Vim_Motion_Result
 vim_motion_character_seek_internal(Application_Links* app,
-                                                              View_ID view,
-                                                              Buffer_ID buffer,
-                                                              i32 motion_count,
-                                                              i64 start_pos,
-                                                              Scan_Direction dir,
-                                                              u32 flags)
+                                   View_ID view,
+                                   Buffer_ID buffer,
+                                   i32 motion_count,
+                                   i64 start_pos,
+                                   Scan_Direction dir,
+                                   u32 flags)
 {
     Vim_Motion_Result result = vim_motion(start_pos);
     result.style  = (dir == Scan_Forward) ? VimRangeStyle_Inclusive : VimRangeStyle_Exclusive;
@@ -4021,7 +4029,7 @@ enum Vim_DCY {
     VimDCY_Yank,
 };
 
- function void
+function void
 vim_delete_change_or_yank(Application_Links* app,
                           Vim_Operator_State* state,
                           View_ID view,
@@ -4088,16 +4096,16 @@ vim_delete_change_or_yank(Application_Links* app,
     if (insert_final_newline) {
         string_list_push(scratch, &yank_string_list, eol);
     }
-
+    
     b32 from_block_copy = (selection.kind == VimSelectionKind_Block);
-
+    
     String_Const_u8 yank_string;
     if (from_block_copy) {
         yank_string = string_list_flatten(scratch, yank_string_list, eol, StringSeparator_AfterLast, StringFill_NoTerminate);
     } else {
         yank_string = string_list_flatten(scratch, yank_string_list, StringFill_NoTerminate);
     }
-
+    
     if (yank_string.size) {
         vim_write_register(app, vim_state.active_register, yank_string, from_block_copy);
     }
@@ -4241,7 +4249,7 @@ vim_paste_internal(Application_Links* app, b32 post_cursor) {
             b32 replaces_something = selection.first_col != selection.one_past_last_col;
             
             Node_String_Const_u8* line = paste_lines.first;
-
+            
             Range_i64 replace_range = {};
             while (vim_selection_consume_line(app, buffer, &selection, &replace_range, true)) {
                 if (replaces_something) {
@@ -4255,10 +4263,10 @@ vim_paste_internal(Application_Links* app, b32 post_cursor) {
                 while (line && string_match(line->string, newline_needle)) {
                     line = line->next;
                 }
-
+                
                 i64 line_number = get_line_number_from_pos(app, buffer, replace_range.first);
                 Buffer_Cursor line_end_cursor = buffer_compute_cursor(app, buffer, seek_line_col(line_number, -1));
-
+                
                 i32 pad_front = 0;
                 if (selection.first_col > line_end_cursor.col) {
                     pad_front = (i32)(selection.first_col - line_end_cursor.col) + 1;
