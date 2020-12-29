@@ -122,6 +122,13 @@
 #define VIM_CURSOR_ROUNDNESS 0.9f
 #endif
 
+#define VIM_KEYBOARD_LAYOUT_DEFAULT 0
+#define VIM_KEYBOARD_LAYOUT_US_INTERNATIONAL 1
+
+#ifndef VIM_KEYBOARD_LAYOUT
+#define VIM_KEYBOARD_LAYOUT VIM_KEYBOARD_LAYOUT_DEFAULT
+#endif
+
 //
 //
 //
@@ -707,6 +714,7 @@ struct Vim_Global_State {
     Vim_Abbreviation*    first_abbreviation;
     
     b32                  current_key_is_retired;
+    b32                  process_text_input_from_dead_key;
     Vim_Key              current_key;
     Vim_Key_Sequence     current_key_sequence;
     
@@ -1171,21 +1179,44 @@ internal User_Input vim_get_next_input(Application_Links *app, Event_Property us
 
 internal String_Const_u8 vim_get_next_writable(Application_Links* app) {
     String_Const_u8 result = SCu8();
+
     if (vim_state.playing_back_command) {
         Assert(vim_state.current_queued_writable);
         result = vim_state.current_queued_writable->writable;
         sll_stack_pop(vim_state.current_queued_writable);
     } else {
-        User_Input in = vim_get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
-        result = to_writable(&in);
-        if (vim_state.command_in_progress) {
-            vim_push_writable(result);
+        i32 input_to_process_count = (vim_state.process_text_input_from_dead_key ? 2 : 1);
+        for (i32 i = 0; i < input_to_process_count; ++i) {
+            User_Input in = vim_get_next_input(app, EventProperty_TextInsert, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+            result = to_writable(&in);
+            if (vim_state.command_in_progress) {
+                vim_push_writable(result);
+            }
+            if (vim_state.capture_queries_into_chord_bar) {
+                vim_append_chord_bar(result, 0);
+            }
         }
+        vim_state.process_text_input_from_dead_key = false;
     }
-    
-    if (vim_state.capture_queries_into_chord_bar) {
-        vim_append_chord_bar(result, 0);
+
+    return result;
+}
+
+function b32
+vim_keystroke_is_dead_key(User_Input in) {
+    b32 result = false;
+
+    // NOTE: Ideally, we'd have an API for this.
+
+    Input_Event* event = &in.event;
+#if VIM_KEYBOARD_LAYOUT == VIM_KEYBOARD_LAYOUT_US_INTERNATIONAL
+    if (match_key_code(event, KeyCode_Quote) ||
+        (match_key_code(event, KeyCode_6) && has_modifier(event, KeyCode_Shift)))
+    {
+        result = true;
     }
+#endif
+
     return result;
 }
 
@@ -1201,7 +1232,7 @@ internal Vim_Key vim_get_key_from_input_query(Application_Links* app, Vim_Query_
     if (mode == VimQuery_CurrentInput) {
         in = get_current_input(app);
     } else if (mode == VimQuery_NextInput) {
-        in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+        in = vim_get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
     } else {
         InvalidPath;
     }
@@ -1212,7 +1243,7 @@ internal Vim_Key vim_get_key_from_input_query(Application_Links* app, Vim_Query_
     
     if (in.event.kind == InputEventKind_KeyStroke) {
         while (key_code_to_vim_modifier(in.event.key.code)) {
-            in = get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
+            in = vim_get_next_input(app, EventProperty_AnyKey, EventProperty_Escape|EventProperty_ViewActivation|EventProperty_Exit);
             if (in.abort) {
                 return result;
             }
@@ -1220,6 +1251,10 @@ internal Vim_Key vim_get_key_from_input_query(Application_Links* app, Vim_Query_
         
         result.kc = in.event.key.code;
         result.mods = input_modifier_set_to_vim_modifiers(in.event.key.modifiers);
+
+        if (vim_keystroke_is_dead_key(in)) {
+            vim_state.process_text_input_from_dead_key = true;
+        }
     }
     
     return result;
@@ -1401,7 +1436,7 @@ internal Vim_Register* vim_query_and_set_register(Application_Links* app, Vim_Bi
     Vim_Register* result = 0;
     Vim_Key key = vim_get_current_key(app);
     Vim_Key_Binding* bind = vim_retrieve_binding(map, key);
-    if (bind && bind->fcoder_command == vim_register) {
+    if (bind && (bind->fcoder_command == vim_register)) {
         String_Const_u8 reg_str = vim_get_next_writable(app);
         if (reg_str.size) {
             char reg_char = reg_str.str[0];
