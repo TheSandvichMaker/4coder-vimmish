@@ -521,21 +521,21 @@ enum Vim_Operator_Flag {
 };
 
 struct Vim_Operator_State {
-    Application_Links* app;
+    Application_Links*   app;
     
-    View_ID view;
-    Buffer_ID buffer;
+    View_ID              view;
+    Buffer_ID            buffer;
     
-    i32 op_count;
-    Vim_Operator* op;
+    i32                  op_count;
+    Vim_Operator*        op;
     
-    i32 motion_count;
-    b32 motion_count_was_set;
-    Vim_Motion* motion;
-    Vim_Text_Object* text_object;
+    i32                  motion_count;
+    b32                  motion_count_was_set;
+    Vim_Motion*          motion;
+    Vim_Text_Object*     text_object;
     
     Vim_Visual_Selection selection;
-    Range_i64 total_range;
+    Range_i64            total_range;
 };
 
 enum Vim_Command_Rep_Kind {
@@ -1308,6 +1308,13 @@ vim_get_key_from_input_query(Application_Links* app, Vim_Query_Mode mode) {
         
         result.kc = in.event.key.code;
         result.mods = input_modifier_set_to_vim_modifiers(in.event.key.modifiers);
+        
+        if (vim_state.capture_queries_into_chord_bar) {
+            // NOTE: Jank alert
+            if (in.event.key.first_dependent_text) {
+                vim_append_chord_bar(in.event.key.first_dependent_text->text.string, result.mods);
+            }
+        }
         
         if (vim_keystroke_is_dead_key(in)) {
             vim_state.process_text_input_from_dead_key = true;
