@@ -1264,8 +1264,8 @@ vim_keystroke_is_dead_key(User_Input in) {
     
     // NOTE: Ideally, we'd have an API for this.
     
-    Input_Event* event = &in.event;
 #if VIM_KEYBOARD_LAYOUT == VIM_KEYBOARD_LAYOUT_US_INTERNATIONAL
+    Input_Event* event = &in.event;
     if (match_key_code(event, KeyCode_Quote) ||
         (match_key_code(event, KeyCode_6) && has_modifier(event, KeyCode_Shift)))
     {
