@@ -257,8 +257,8 @@ vim_string_copy_dynamic(Base_Allocator* alloc,
                 base_free(alloc, dest->str);
             }
             
-            Data memory = base_allocate(alloc, new_cap);
-            dest->str = (u8*)memory.data;
+            String_Const_u8 memory = base_allocate(alloc, new_cap);
+            dest->str = (u8*)memory.str;
             dest->cap = memory.size;
         }
     }
@@ -292,14 +292,14 @@ vim_string_append_dynamic(Base_Allocator* alloc,
         new_cap = Max(256, new_cap);
         
         if (new_cap != dest->cap) {
-            Data memory = base_allocate(alloc, new_cap);
+            String_Const_u8 memory = base_allocate(alloc, new_cap);
             
             if (dest->str) {
-                block_copy(memory.data, dest->str, dest->size);
+                block_copy(memory.str, dest->str, dest->size);
                 base_free(alloc, dest->str);
             }
             
-            dest->str = (u8*)memory.data;
+            dest->str = (u8*)memory.str;
             dest->cap = memory.size;
         }
     }
@@ -1948,7 +1948,7 @@ vim_select_mapid_for_mode(Application_Links* app, Buffer_ID buffer, Vim_Mode mod
                 Assert(*insert_map_id_ptr);
                 *map_id_ptr = *insert_map_id_ptr;
             } else {
-                *map_id_ptr = mapid_file;
+                *map_id_ptr = vars_save_string_lit("keys_file");
             }
         } break;
         case VimMode_Visual:
@@ -4415,7 +4415,8 @@ VIM_OPERATOR(vim_auto_indent) {
 function void
 vim_shift_indentation_of_line(Application_Links* app, Buffer_ID buffer, i64 line, Scan_Direction dir) {
     // @TODO: Support adding/removing indentation in the middle of lines (using visual block and whatnot)
-    i32 indent_width = global_config.indent_width;
+    i32 indent_width = (i32)def_get_config_u64(app, vars_save_string_lit("indent_width"));
+    b32 indent_with_tabs = def_get_config_b32(vars_save_string_lit("indent_with_tabs"));
     
     Scratch_Block scratch(app);
     String_Const_u8 line_text = push_buffer_line(app, scratch, buffer, line);
@@ -4433,7 +4434,7 @@ vim_shift_indentation_of_line(Application_Links* app, Buffer_ID buffer, i64 line
         }
         buffer_replace_range(app, buffer, Ii64_size(line_start, characters_to_remove), SCu8());
     } else if (dir == Scan_Forward) {
-        if (global_config.indent_with_tabs){
+        if (indent_with_tabs){
             buffer_replace_range(app, buffer, Ii64(line_start), string_u8_litexpr("\t"));
         } else {
             u8* str = push_array(scratch, u8, indent_width);
@@ -5487,22 +5488,51 @@ vim_render_buffer(Application_Links *app,
     b32 is_active_view = (active_view == view_id);
     Rect_f32 prev_clip = draw_set_clip(app, rect);
     
+    Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
+    
+    // NOTE(allen): Cursor shape
+    Face_Metrics metrics = get_face_metrics(app, face_id);
+    u64 cursor_roundness_100 = def_get_config_u64(app, vars_save_string_lit("cursor_roundness"));
+    f32 cursor_roundness = metrics.normal_advance*cursor_roundness_100*0.01f;
+    f32 mark_thickness = (f32)def_get_config_u64(app, vars_save_string_lit("mark_thickness"));
+    
     // NOTE(allen): Token colorizing
     Token_Array token_array = get_token_array_from_buffer(app, buffer);
     if (token_array.tokens != 0){
         draw_cpp_token_colors(app, text_layout_id, &token_array);
         
         // NOTE(allen): Scan for TODOs and NOTEs
-        if (global_config.use_comment_keyword){
+        b32 use_comment_keyword = def_get_config_b32(vars_save_string_lit("use_comment_keyword"));
+        if (use_comment_keyword){
             Comment_Highlight_Pair pairs[] = {
-                { string_u8_litexpr("NOTE"), finalize_color(defcolor_comment_pop, 0) },
-                { string_u8_litexpr("TODO"), finalize_color(defcolor_comment_pop, 1) },
+                {string_u8_litexpr("NOTE"), finalize_color(defcolor_comment_pop, 0)},
+                {string_u8_litexpr("TODO"), finalize_color(defcolor_comment_pop, 1)},
             };
             draw_comment_highlights(app, buffer, text_layout_id, &token_array, pairs, ArrayCount(pairs));
         }
+        
+#if 0
+        // TODO(allen): Put in 4coder_draw.cpp
+        // NOTE(allen): Color functions
+        
+        Scratch_Block scratch(app);
+        ARGB_Color argb = 0xFFFF00FF;
+        
+        Token_Iterator_Array it = token_iterator_pos(0, &token_array, visible_range.first);
+        for (;;){
+            if (!token_it_inc_non_whitespace(&it)){
+                break;
+            }
+            Token *token = token_it_read(&it);
+            String_Const_u8 lexeme = push_token_lexeme(app, scratch, buffer, token);
+            Code_Index_Note *note = code_index_note_from_string(lexeme);
+            if (note != 0 && note->note_kind == CodeIndexNote_Function){
+                paint_text_color(app, text_layout_id, Ii64_size(token->pos, token->size), argb);
+            }
+        }
+#endif
     }
     else{
-        Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
         paint_text_color_fcolor(app, text_layout_id, visible_range, fcolor_id(defcolor_text_default));
     }
     
@@ -5510,49 +5540,61 @@ vim_render_buffer(Application_Links *app,
     view_correct_mark(app, view_id);
     
     // NOTE(allen): Scope highlight
-    if (global_config.use_scope_highlight){
+    b32 use_scope_highlight = def_get_config_b32(vars_save_string_lit("use_scope_highlight"));
+    if (use_scope_highlight){
         Color_Array colors = finalize_color_array(defcolor_back_cycle);
         draw_scope_highlight(app, buffer, text_layout_id, cursor_pos, colors.vals, colors.count);
     }
     
-    if (global_config.use_error_highlight || global_config.use_jump_highlight){
+    b32 use_error_highlight = def_get_config_b32(vars_save_string_lit("use_error_highlight"));
+    b32 use_jump_highlight = def_get_config_b32(vars_save_string_lit("use_jump_highlight"));
+    if (use_error_highlight || use_jump_highlight){
         // NOTE(allen): Error highlight
         String_Const_u8 name = string_u8_litexpr("*compilation*");
         Buffer_ID compilation_buffer = get_buffer_by_name(app, name, Access_Always);
-        if (global_config.use_error_highlight){
-            draw_jump_highlights(app, buffer, text_layout_id, compilation_buffer, fcolor_id(defcolor_highlight_junk));
+        if (use_error_highlight){
+            draw_jump_highlights(app, buffer, text_layout_id, compilation_buffer,
+                                 fcolor_id(defcolor_highlight_junk));
         }
         
         // NOTE(allen): Search highlight
-        if (global_config.use_jump_highlight){
+        if (use_jump_highlight){
             Buffer_ID jump_buffer = get_locked_jump_buffer(app);
             if (jump_buffer != compilation_buffer){
-                draw_jump_highlights(app, buffer, text_layout_id, jump_buffer, fcolor_id(defcolor_highlight_white));
+                draw_jump_highlights(app, buffer, text_layout_id, jump_buffer,
+                                     fcolor_id(defcolor_highlight_white));
             }
         }
     }
     
     // NOTE(allen): Color parens
-    if (global_config.use_paren_helper){
+    b32 use_paren_helper = def_get_config_b32(vars_save_string_lit("use_paren_helper"));
+    if (use_paren_helper){
         Color_Array colors = finalize_color_array(defcolor_text_cycle);
         draw_paren_highlight(app, buffer, text_layout_id, cursor_pos, colors.vals, colors.count);
     }
     
     // NOTE(allen): Line highlight
-    if (!is_vim_visual_mode(vim_state.mode) && global_config.highlight_line_at_cursor && is_active_view){
+    b32 highlight_line_at_cursor = def_get_config_b32(vars_save_string_lit("highlight_line_at_cursor"));
+    if (highlight_line_at_cursor && is_active_view){
         i64 line_number = get_line_number_from_pos(app, buffer, cursor_pos);
         draw_line_highlight(app, text_layout_id, line_number, fcolor_id(defcolor_highlight_cursor_line));
     }
     
-    // NOTE(allen): Cursor shape
-    Face_Metrics metrics = get_face_metrics(app, face_id);
-    f32 cursor_roundness = (metrics.normal_advance*0.5f)*VIM_CURSOR_ROUNDNESS;
-    f32 mark_thickness = 2.0f;
+    // NOTE(allen): Whitespace highlight
+    b64 show_whitespace = false;
+    view_get_setting(app, view_id, ViewSetting_ShowWhitespace, &show_whitespace);
+    if (show_whitespace){
+        if (token_array.tokens == 0){
+            draw_whitespace_highlight(app, buffer, text_layout_id, cursor_roundness);
+        }
+        else{
+            draw_whitespace_highlight(app, text_layout_id, &token_array, cursor_roundness);
+        }
+    }
     
-    Range_i64 visible_range = text_layout_get_visible_range(app, text_layout_id);
-    
+    // NOTE: Vim Search highlight
     if (vim_state.search_show_highlight) {
-        // NOTE: Vim Search highlight
         i64 pos = visible_range.min;
         while (pos < visible_range.max) {
             Range_i64 highlight_range = vim_search_once_internal(app, view_id, buffer, Scan_Forward, pos, vim_state.last_search_register.string.string, vim_state.search_flags, true);
@@ -5836,8 +5878,9 @@ vim_render_caller(Application_Links *app, Frame_Info frame_info, View_ID view_id
     }
     
     // NOTE(allen): layout line numbers
+    b32 show_line_number_margins = def_get_config_b32(vars_save_string_lit("show_line_number_margins"));
     Rect_f32 line_number_rect = {};
-    if (global_config.show_line_number_margins){
+    if (show_line_number_margins){
         Rect_f32_Pair pair = layout_line_number_margin(app, buffer, region, digit_advance);
         line_number_rect = pair.min;
         region = pair.max;
@@ -5848,7 +5891,7 @@ vim_render_caller(Application_Links *app, Frame_Info frame_info, View_ID view_id
     Text_Layout_ID text_layout_id = text_layout_create(app, buffer, region, buffer_point);
     
     // NOTE(allen): draw line numbers
-    if (global_config.show_line_number_margins){
+    if (show_line_number_margins){
         draw_line_number_margin(app, view_id, buffer, face_id, text_layout_id, line_number_rect);
     }
     
@@ -5869,7 +5912,8 @@ BUFFER_HOOK_SIG(vim_begin_buffer) {
     *map_id_ptr = vim_mapid_normal;
     
     local_persist b32 warned_virtual_whitespace = false;
-    if (!warned_virtual_whitespace && global_config.enable_virtual_whitespace) {
+    b32 is_virtual = def_get_config_b32(vars_save_string_lit("enable_virtual_whitespace"));
+    if (!warned_virtual_whitespace && is_virtual) {
         vim_echo_alert(app, "Warning: Virtual Whitespace is not yet properly supported by 4coder_vimmish.");
         warned_virtual_whitespace = true;
     }
@@ -6052,6 +6096,8 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
 {
     Thread_Context *tctx = get_thread_context(app);
     Scratch_Block scratch(tctx);
+
+    String_ID global_map_id = vars_save_string_lit("keys_global");
     
     {
         View_ID view = get_this_ctx_view(app, Access_Always);
@@ -6062,7 +6108,7 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
         
         View_Context ctx = view_current_context(app, view);
         ctx.mapping = &framework_mapping;
-        ctx.map_id = mapid_global;
+        ctx.map_id = global_map_id;
         view_alter_context(app, view, &ctx);
     }
     
@@ -6095,7 +6141,7 @@ CUSTOM_DOC("[vim] Input consumption loop for view behavior")
         
         Command_Map_ID* map_id_ptr = scope_attachment(app, buffer_scope, buffer_map_id, Command_Map_ID);
         if (*map_id_ptr == 0) {
-            *map_id_ptr = mapid_file;
+            *map_id_ptr = vars_save_string_lit("keys_file");
         }
         Command_Map_ID map_id = *map_id_ptr;
         
@@ -6229,12 +6275,16 @@ function void
 vim_setup_default_mapping(Application_Links* app, Mapping *mapping, Vim_Key vim_leader) {
     MappingScope();
     SelectMapping(mapping);
-    
+
+    String_ID global_map_id = vars_save_string_lit("keys_global");
+    String_ID file_map_id = vars_save_string_lit("keys_file");
+    String_ID code_map_id = vars_save_string_lit("keys_code");
+
     //
     // Global Map
     //
     
-    SelectMap(mapid_global);
+    SelectMap(global_map_id);
     
     BindCore(default_startup,          CoreCode_Startup);
     BindCore(default_try_exit,         CoreCode_TryExit);
@@ -6278,8 +6328,8 @@ vim_setup_default_mapping(Application_Links* app, Mapping *mapping, Vim_Key vim_
     // File Map
     //
     
-    SelectMap(mapid_file);
-    ParentMap(mapid_global);
+    SelectMap(file_map_id);
+    ParentMap(global_map_id);
     
     BindMouse(click_set_cursor_and_mark, MouseCode_Left);
     BindMouseRelease(click_set_cursor, MouseCode_Left);
@@ -6329,8 +6379,8 @@ vim_setup_default_mapping(Application_Links* app, Mapping *mapping, Vim_Key vim_
     // Code Map
     //
     
-    SelectMap(mapid_code);
-    ParentMap(mapid_file);
+    SelectMap(code_map_id);
+    ParentMap(file_map_id);
     
     BindMouse(click_set_cursor_and_mark, MouseCode_Left);
     BindMouseRelease(click_set_cursor, MouseCode_Left);
@@ -6376,7 +6426,7 @@ vim_setup_default_mapping(Application_Links* app, Mapping *mapping, Vim_Key vim_
     //
     
     SelectMap(vim_mapid_normal);
-    ParentMap(mapid_global);
+    ParentMap(global_map_id);
     
     BindMouse(vim_start_mouse_select, MouseCode_Left);
     BindMouseRelease(click_set_cursor, MouseCode_Left);
